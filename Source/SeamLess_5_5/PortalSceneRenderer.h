@@ -1,20 +1,18 @@
-//// Source/YourProject/PortalSceneRenderer.h
-//
 //#pragma once
 //
 //#include "CoreMinimal.h"
 //#include "SceneView.h"
 //#include "DeferredShadingRenderer.h"
 //
-//// Portal 정보 구조체
 //struct FPortalInfo
 //{
-//    FMatrix Transform;
-//    FSceneViewStateInterface* ViewState;
+//    FMatrix PortalTransform;
+//    FMatrix LinkedTransform;
+//    FConvexVolume PortalFrustum;
+//    FBox PortalVisibleBounds;
 //    TWeakObjectPtr<class APortalActor> PortalActor;
 //};
 //
-//// Custom Renderer
 //class FPortalSceneRenderer : public FDeferredShadingSceneRenderer
 //{
 //public:
@@ -25,15 +23,11 @@
 //
 //    virtual ~FPortalSceneRenderer() {}
 //
-//    // 메인 렌더링 오버라이드
 //    virtual void Render(FRDGBuilder& GraphBuilder) override;
 //
-//    // Portal 렌더링
-//    void RenderPortalView(
-//        FRDGBuilder& GraphBuilder,
-//        const FPortalInfo& Portal
-//    );
-//
 //private:
+//    void ComputePortalFrustums();
+//    void RenderPortalView(FRDGBuilder& GraphBuilder, const FPortalInfo& Portal);
+//
 //    TArray<FPortalInfo> ActivePortals;
 //};

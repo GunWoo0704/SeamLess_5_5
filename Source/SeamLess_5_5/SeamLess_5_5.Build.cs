@@ -1,3 +1,4 @@
+using System.IO;
 using UnrealBuildTool;
 
 public class SeamLess_5_5 : ModuleRules
@@ -20,6 +21,11 @@ public class SeamLess_5_5 : ModuleRules
             "RenderCore",        // 추가
             "Renderer",          // 추가
             "RHI",               // 추가
+        });
+
+        PrivateIncludePaths.AddRange(new string[]
+        {
+            Path.Combine(EngineDirectory, "Source/Runtime/Renderer/Private"),
         });
     }
 }

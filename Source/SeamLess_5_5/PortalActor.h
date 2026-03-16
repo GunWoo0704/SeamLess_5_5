@@ -9,6 +9,8 @@
 #include "Materials/MaterialInterface.h"
 #include "Materials/MaterialInstanceDynamic.h"
 #include "Engine/Scene.h"
+#include "SceneViewExtension.h"
+#include "PortalViewExtension.h"
 #include "PortalActor.generated.h"
 
 UCLASS()
@@ -25,11 +27,8 @@ public:
     UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Portal")
     UStaticMeshComponent* PortalMesh;
 
-    UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Portal|Stereo")
-    USceneCaptureComponent2D* SceneCaptureLeft;
-
-    UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Portal|Stereo")
-    USceneCaptureComponent2D* SceneCaptureRight;
+    UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Portal")
+    USceneCaptureComponent2D* SceneCapture;
 
     UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Portal")
     UBoxComponent* TriggerVolume;
@@ -40,15 +39,8 @@ public:
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Portal")
     APortalActor* LinkedPortal;
 
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Portal|Stereo")
-    UTextureRenderTarget2D* RenderTargetLeft;
-
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Portal|Stereo")
-    UTextureRenderTarget2D* RenderTargetRight;
-
-    // IPD (동공간 거리 cm, 기본값 6.4cm)
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Portal|Stereo")
-    float IPD = 6.4f;
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Portal")
+    UTextureRenderTarget2D* RenderTarget;
 
     virtual void Tick(float DeltaTime) override;
     virtual void BeginPlay() override;
@@ -64,9 +56,10 @@ protected:
 
 private:
     void UpdateSceneCapture();
-    void SetupCaptureComponent(USceneCaptureComponent2D* Capture);
-    FTransform GetPortalCameraTransform(const FVector& CameraLocation, const FRotator& CameraRotation);
+    void UpdatePortalFrustumData();
 
     UPROPERTY()
     UMaterialInstanceDynamic* DynamicMaterial;
+
+    TSharedPtr<FPortalViewExtension, ESPMode::ThreadSafe> ViewExtension;
 };

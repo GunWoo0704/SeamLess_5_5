@@ -6,6 +6,8 @@
 #include "IXRTrackingSystem.h"
 #include "Engine/Engine.h"
 #include "DrawDebugHelpers.h"
+#include "Engine/World.h"
+#include "EngineUtils.h"
 
 APortalActor::APortalActor()
 {
@@ -17,16 +19,15 @@ APortalActor::APortalActor()
     PortalMesh = CreateDefaultSubobject<UStaticMeshComponent>(TEXT("PortalMesh"));
     PortalMesh->SetupAttachment(PortalRoot);
     PortalMesh->SetMobility(EComponentMobility::Movable);
-    PortalMesh->SetRelativeRotation(FRotator(0.0f, 0.0f, 0.0f));
+    PortalMesh->SetRelativeRotation(FRotator(0.0f, 0.0f, 90.0f));
     PortalMesh->SetCollisionEnabled(ECollisionEnabled::NoCollision);
 
-    SceneCaptureLeft = CreateDefaultSubobject<USceneCaptureComponent2D>(TEXT("SceneCaptureLeft"));
-    SceneCaptureLeft->SetupAttachment(PortalRoot);
-    SetupCaptureComponent(SceneCaptureLeft);
-
-    SceneCaptureRight = CreateDefaultSubobject<USceneCaptureComponent2D>(TEXT("SceneCaptureRight"));
-    SceneCaptureRight->SetupAttachment(PortalRoot);
-    SetupCaptureComponent(SceneCaptureRight);
+    SceneCapture = CreateDefaultSubobject<USceneCaptureComponent2D>(TEXT("SceneCapture"));
+    SceneCapture->SetupAttachment(PortalRoot);
+    SceneCapture->bCaptureEveryFrame = false;
+    SceneCapture->bCaptureOnMovement = false;
+    SceneCapture->CaptureSource = ESceneCaptureSource::SCS_SceneColorHDR;
+    SceneCapture->bAlwaysPersistRenderingState = true;
 
     TriggerVolume = CreateDefaultSubobject<UBoxComponent>(TEXT("TriggerVolume"));
     TriggerVolume->SetupAttachment(PortalRoot);
@@ -37,49 +38,32 @@ APortalActor::APortalActor()
     TriggerVolume->SetGenerateOverlapEvents(true);
 }
 
-void APortalActor::SetupCaptureComponent(USceneCaptureComponent2D* Capture)
-{
-    Capture->bCaptureEveryFrame = false;
-    Capture->bCaptureOnMovement = false;
-    Capture->CaptureSource = ESceneCaptureSource::SCS_SceneColorHDR;
-    Capture->bAlwaysPersistRenderingState = true;
-    Capture->PostProcessSettings.bOverride_DynamicGlobalIlluminationMethod = true;
-    Capture->PostProcessSettings.DynamicGlobalIlluminationMethod = EDynamicGlobalIlluminationMethod::Lumen;
-    Capture->PostProcessSettings.bOverride_ReflectionMethod = true;
-    Capture->PostProcessSettings.ReflectionMethod = EReflectionMethod::Lumen;
-    Capture->PostProcessSettings.bOverride_LumenSceneDetail = true;
-    Capture->PostProcessSettings.LumenSceneDetail = 1.0f;
-    Capture->ShowFlags.SetGlobalIllumination(true);
-}
-
 void APortalActor::BeginPlay()
 {
     Super::BeginPlay();
 
-    if (!RenderTargetLeft)
+    ViewExtension = FSceneViewExtensions::NewExtension<FPortalViewExtension>();
+
+    if (!RenderTarget)
     {
-        RenderTargetLeft = NewObject<UTextureRenderTarget2D>(this);
-        RenderTargetLeft->InitAutoFormat(1920, 1080);
-        RenderTargetLeft->bAutoGenerateMips = false;
-        RenderTargetLeft->RenderTargetFormat = RTF_RGBA16f;
+        RenderTarget = NewObject<UTextureRenderTarget2D>(this);
+        RenderTarget->InitAutoFormat(1920, 1080);
+        RenderTarget->bAutoGenerateMips = false;
+        RenderTarget->RenderTargetFormat = RTF_RGBA16f;
     }
 
-    if (!RenderTargetRight)
-    {
-        RenderTargetRight = NewObject<UTextureRenderTarget2D>(this);
-        RenderTargetRight->InitAutoFormat(1920, 1080);
-        RenderTargetRight->bAutoGenerateMips = false;
-        RenderTargetRight->RenderTargetFormat = RTF_RGBA16f;
-    }
-
-    SceneCaptureLeft->TextureTarget = RenderTargetLeft;
-    SceneCaptureRight->TextureTarget = RenderTargetRight;
+    SceneCapture->TextureTarget = RenderTarget;
+    SceneCapture->ShowFlags.SetAtmosphere(true);
+    SceneCapture->ShowFlags.SetSkyLighting(true);
+    SceneCapture->ShowFlags.SetFog(true);
+    SceneCapture->ShowFlags.SetVolumetricFog(true);
+    SceneCapture->ShowFlags.SetDynamicShadows(true);
 
     if (PortalMaterial)
     {
         DynamicMaterial = UMaterialInstanceDynamic::Create(PortalMaterial, this);
-        DynamicMaterial->SetTextureParameterValue(FName("RenderTargetLeft"), RenderTargetLeft);
-        DynamicMaterial->SetTextureParameterValue(FName("RenderTargetRight"), RenderTargetRight);
+        DynamicMaterial->SetTextureParameterValue(FName("RenderTargetLeft"), RenderTarget);
+        DynamicMaterial->SetTextureParameterValue(FName("RenderTargetRight"), RenderTarget);
         PortalMesh->SetMaterial(0, DynamicMaterial);
     }
 
@@ -90,26 +74,67 @@ void APortalActor::Tick(float DeltaTime)
 {
     Super::Tick(DeltaTime);
 
-    if (LinkedPortal)
+    if (!LinkedPortal || !ViewExtension.IsValid()) return;
+
+    // 씬 액터 Bounds 수집 → Extension에 전달 (게임 스레드)
+    TArray<FBoxSphereBounds> ActorBounds;
+    for (TActorIterator<AActor> It(GetWorld()); It; ++It)
     {
-        UpdateSceneCapture();
+        AActor* Actor = *It;
+        if (Actor && Actor != this && Actor->GetRootComponent())
+        {
+            FBox Box = Actor->GetComponentsBoundingBox();
+            ActorBounds.Add(FBoxSphereBounds(Box));
+        }
+    }
+    ViewExtension->UpdateSceneActorBounds(ActorBounds);
+
+    UpdatePortalFrustumData();
+    UpdateSceneCapture();
+
+    // 플레이어가 Portal에서 500cm 이내일 때만 캡처
+    APawn* PlayerPawn = UGameplayStatics::GetPlayerPawn(GetWorld(), 0);
+    if (PlayerPawn)
+    {
+        float DistToPortal = FVector::Dist(
+            PlayerPawn->GetActorLocation(),
+            GetActorLocation());
+
+        if (DistToPortal < 500.0f)
+            SceneCapture->CaptureScene();
     }
 }
 
-FTransform APortalActor::GetPortalCameraTransform(const FVector& CameraLocation, const FRotator& CameraRotation)
+void APortalActor::UpdatePortalFrustumData()
 {
-    FTransform ThisTransform = GetActorTransform();
-    FVector LocalPos = ThisTransform.InverseTransformPosition(CameraLocation);
-    FQuat LocalRot = ThisTransform.InverseTransformRotation(CameraRotation.Quaternion());
+    if (!ViewExtension.IsValid()) return;
 
-    LocalPos.X = -LocalPos.X;
-    LocalRot = FQuat(FVector::UpVector, PI) * LocalRot;
+    APawn* PlayerPawn = UGameplayStatics::GetPlayerPawn(GetWorld(), 0);
+    if (!PlayerPawn) return;
 
-    FTransform LinkedTransform = LinkedPortal->GetActorTransform();
-    FVector TargetPos = LinkedTransform.TransformPosition(LocalPos);
-    FQuat TargetRot = LinkedTransform.TransformRotation(LocalRot);
+    UCameraComponent* Camera = PlayerPawn->FindComponentByClass<UCameraComponent>();
+    if (!Camera) return;
 
-    return FTransform(TargetRot, TargetPos);
+    FPortalFrustumData FrustumData;
+    FrustumData.EyePosition = Camera->GetComponentLocation();
+
+    FVector PortalCenter = PortalMesh->GetComponentLocation();
+    FVector Right = PortalMesh->GetRightVector();
+    FVector Up = PortalMesh->GetUpVector();
+
+    FVector Scale = PortalMesh->GetComponentScale();
+    float HalfWidth = 50.0f * Scale.Y;
+    float HalfHeight = 50.0f * Scale.Z;
+
+    FrustumData.Corners[0] = PortalCenter + (Right * HalfWidth) + (Up * HalfHeight);
+    FrustumData.Corners[1] = PortalCenter - (Right * HalfWidth) + (Up * HalfHeight);
+    FrustumData.Corners[2] = PortalCenter - (Right * HalfWidth) - (Up * HalfHeight);
+    FrustumData.Corners[3] = PortalCenter + (Right * HalfWidth) - (Up * HalfHeight);
+
+    FrustumData.PortalBounds = PortalMesh->Bounds.GetBox();
+    FrustumData.bIsValid = true;
+
+    ViewExtension->UpdatePortalFrustum(FrustumData);
 }
 
 void APortalActor::UpdateSceneCapture()
@@ -125,28 +150,24 @@ void APortalActor::UpdateSceneCapture()
     FVector CameraLocation = Camera->GetComponentLocation();
     FRotator CameraRotation = Camera->GetComponentRotation();
 
-    FVector RightVector = CameraRotation.RotateVector(FVector::RightVector);
-    float HalfIPD = IPD * 0.5f;
+    FTransform ThisTransform = GetActorTransform();
+    FVector LocalPos = ThisTransform.InverseTransformPosition(CameraLocation);
+    FQuat LocalRot = ThisTransform.InverseTransformRotation(CameraRotation.Quaternion());
 
-    // 왼쪽 눈
-    FVector LeftEyePos = CameraLocation - RightVector * HalfIPD;
-    FTransform LeftTransform = GetPortalCameraTransform(LeftEyePos, CameraRotation);
-    SceneCaptureLeft->SetWorldLocationAndRotation(LeftTransform.GetLocation(), LeftTransform.GetRotation().Rotator());
+    LocalPos.X = -LocalPos.X;
+    LocalRot = FQuat(FVector::UpVector, PI) * LocalRot;
 
-    // 오른쪽 눈
-    FVector RightEyePos = CameraLocation + RightVector * HalfIPD;
-    FTransform RightTransform = GetPortalCameraTransform(RightEyePos, CameraRotation);
-    SceneCaptureRight->SetWorldLocationAndRotation(RightTransform.GetLocation(), RightTransform.GetRotation().Rotator());
+    FTransform LinkedTransform = LinkedPortal->GetActorTransform();
+    FVector TargetPos = LinkedTransform.TransformPosition(LocalPos);
+    FQuat TargetRot = LinkedTransform.TransformRotation(LocalRot);
+
+    SceneCapture->SetWorldLocationAndRotation(TargetPos, TargetRot.Rotator());
 
     APlayerCameraManager* CameraManager = UGameplayStatics::GetPlayerCameraManager(GetWorld(), 0);
     if (CameraManager)
     {
-        SceneCaptureLeft->FOVAngle = CameraManager->GetFOVAngle();
-        SceneCaptureRight->FOVAngle = CameraManager->GetFOVAngle();
+        SceneCapture->FOVAngle = CameraManager->GetFOVAngle();
     }
-
-    SceneCaptureLeft->CaptureScene();
-    SceneCaptureRight->CaptureScene();
 }
 
 void APortalActor::OnOverlapBegin(UPrimitiveComponent* OverlappedComp,
