@@ -57,9 +57,15 @@ protected:
 private:
     void UpdateSceneCapture();
     void UpdatePortalFrustumData();
+    void CacheSceneActorBounds();  // 추가
 
     UPROPERTY()
     UMaterialInstanceDynamic* DynamicMaterial;
 
     TSharedPtr<FPortalViewExtension, ESPMode::ThreadSafe> ViewExtension;
+
+    // 액터 Bounds 캐시
+    TArray<FBoxSphereBounds> CachedActorBounds;
+    float ActorBoundsCacheTimer = 0.0f;
+    static constexpr float ActorBoundsCacheInterval = 0.5f;
 };

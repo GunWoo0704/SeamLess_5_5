@@ -44,6 +44,9 @@ void APortalActor::BeginPlay()
 
     ViewExtension = FSceneViewExtensions::NewExtension<FPortalViewExtension>();
 
+    // 초기 액터 Bounds 캐시 수집
+    CacheSceneActorBounds();
+
     if (!RenderTarget)
     {
         RenderTarget = NewObject<UTextureRenderTarget2D>(this);
@@ -76,18 +79,13 @@ void APortalActor::Tick(float DeltaTime)
 
     if (!LinkedPortal || !ViewExtension.IsValid()) return;
 
-    // 씬 액터 Bounds 수집 → Extension에 전달 (게임 스레드)
-    TArray<FBoxSphereBounds> ActorBounds;
-    for (TActorIterator<AActor> It(GetWorld()); It; ++It)
+    // 0.5초마다 액터 Bounds 갱신 (매 프레임 아님)
+    ActorBoundsCacheTimer += DeltaTime;
+    if (ActorBoundsCacheTimer >= ActorBoundsCacheInterval)
     {
-        AActor* Actor = *It;
-        if (Actor && Actor != this && Actor->GetRootComponent())
-        {
-            FBox Box = Actor->GetComponentsBoundingBox();
-            ActorBounds.Add(FBoxSphereBounds(Box));
-        }
+        ActorBoundsCacheTimer = 0.0f;
+        CacheSceneActorBounds();
     }
-    ViewExtension->UpdateSceneActorBounds(ActorBounds);
 
     UpdatePortalFrustumData();
     UpdateSceneCapture();
@@ -103,6 +101,22 @@ void APortalActor::Tick(float DeltaTime)
         if (DistToPortal < 500.0f)
             SceneCapture->CaptureScene();
     }
+}
+
+void APortalActor::CacheSceneActorBounds()
+{
+    CachedActorBounds.Reset();
+    for (TActorIterator<AActor> It(GetWorld()); It; ++It)
+    {
+        AActor* Actor = *It;
+        if (Actor && Actor != this && Actor->GetRootComponent())
+        {
+            FBox Box = Actor->GetComponentsBoundingBox();
+            if (Box.IsValid)
+                CachedActorBounds.Add(FBoxSphereBounds(Box));
+        }
+    }
+    ViewExtension->UpdateSceneActorBounds(CachedActorBounds);
 }
 
 void APortalActor::UpdatePortalFrustumData()
