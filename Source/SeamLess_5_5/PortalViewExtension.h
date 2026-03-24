@@ -19,17 +19,23 @@ public:
     virtual ~FPortalViewExtension();
 
     virtual void SetupViewFamily(FSceneViewFamily& InViewFamily) override;
-    virtual void PreRenderViewFamily_RenderThread(
-        FRDGBuilder& GraphBuilder,
-        FSceneViewFamily& InViewFamily) override;
-
     virtual void SetupView(FSceneViewFamily& InViewFamily, FSceneView& InView) override {}
     virtual void BeginRenderViewFamily(FSceneViewFamily& InViewFamily) override {}
     virtual void PreRenderView_RenderThread(FRDGBuilder& GraphBuilder, FSceneView& InView) override {}
 
+    virtual void PreRenderViewFamily_RenderThread(
+        FRDGBuilder& GraphBuilder,
+        FSceneViewFamily& InViewFamily) override;
+
+    virtual void PostRenderBasePassDeferred_RenderThread(
+        FRDGBuilder& GraphBuilder,
+        FSceneView& InView,
+        const FRenderTargetBindingSlots& RenderTargets,
+        TRDGUniformBufferRef<FSceneTextureUniformParameters> SceneTextures) override;
+
     void UpdatePortalData(const TArray<FBox>& InPortalBounds);
     void UpdatePortalFrustum(const FPortalFrustumData& InFrustumData);
-    void UpdateSceneActorBounds(const TArray<FBoxSphereBounds>& InBounds);  // 추가
+    void UpdateSceneActorBounds(const TArray<FBoxSphereBounds>& InBounds);
 
 private:
     void BuildPortalConvexVolume(
@@ -41,8 +47,8 @@ private:
         const FConvexVolume& PortalVolume,
         const FVector& EyePos);
 
-    TArray<FBox> PortalVisibleBounds;
-    TArray<FBoxSphereBounds> SceneActorBounds;  // 추가
-    FPortalFrustumData PortalFrustum;
-    FCriticalSection DataLock;
+    TArray<FBox>             PortalVisibleBounds;
+    TArray<FBoxSphereBounds> SceneActorBounds;
+    FPortalFrustumData       PortalFrustum;
+    FCriticalSection         DataLock;
 };

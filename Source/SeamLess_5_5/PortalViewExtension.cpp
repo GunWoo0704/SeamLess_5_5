@@ -2,6 +2,7 @@
 #include "RenderGraphBuilder.h"
 #include "HAL/IConsoleManager.h"
 #include "RendererInterface.h"
+#include "SceneView.h"
 
 FPortalViewExtension::FPortalViewExtension(const FAutoRegister& AutoRegister)
     : FSceneViewExtensionBase(AutoRegister)
@@ -55,7 +56,6 @@ void FPortalViewExtension::BuildPortalConvexVolume(
 
     FVector PortalForward = (Center - EyePos).GetSafeNormal();
     OutVolume.Planes.Add(FPlane(EyePos + PortalForward * 10.0f, -PortalForward));
-
     OutVolume.Init();
 }
 
@@ -64,13 +64,11 @@ float FPortalViewExtension::ComputeOptimalLumenDistance(
     const FVector& EyePos)
 {
     float MaxDist = 1000.0f;
-    int32 InFrustum = 0;
 
     for (const FBoxSphereBounds& Bounds : SceneActorBounds)
     {
         if (PortalVolume.IntersectSphere(Bounds.Origin, Bounds.SphereRadius))
         {
-            InFrustum++;
             float Dist = FVector::Dist(EyePos, Bounds.Origin) + Bounds.SphereRadius;
             MaxDist = FMath::Max(MaxDist, Dist);
         }
@@ -83,7 +81,6 @@ void FPortalViewExtension::PreRenderViewFamily_RenderThread(
     FRDGBuilder& GraphBuilder,
     FSceneViewFamily& InViewFamily)
 {
-
     if (InViewFamily.Views.Num() > 0 && InViewFamily.Views[0]->bIsSceneCapture)
         return;
 
@@ -102,15 +99,9 @@ void FPortalViewExtension::PreRenderViewFamily_RenderThread(
     if (PortalFrustum.bIsValid && SceneActorBounds.Num() > 0)
     {
         FConvexVolume PortalVolume;
-        BuildPortalConvexVolume(
-            PortalFrustum.EyePosition,
-            PortalFrustum.Corners,
-            PortalVolume);
+        BuildPortalConvexVolume(PortalFrustum.EyePosition, PortalFrustum.Corners, PortalVolume);
 
-        float OptimalDistance = ComputeOptimalLumenDistance(
-            PortalVolume,
-            PortalFrustum.EyePosition);
-
+        float OptimalDistance = ComputeOptimalLumenDistance(PortalVolume, PortalFrustum.EyePosition);
         GPortalFrustumMaxDistance = OptimalDistance;
 
         if (FMath::Abs(OptimalDistance - LastOptimalDistance) > 100.0f)
@@ -131,10 +122,7 @@ void FPortalViewExtension::PreRenderViewFamily_RenderThread(
     {
         float MaxRadius = 0.0f;
         for (const FBox& Box : PortalVisibleBounds)
-        {
-            float Radius = Box.GetExtent().Size();
-            MaxRadius = FMath::Max(MaxRadius, Radius);
-        }
+            MaxRadius = FMath::Max(MaxRadius, Box.GetExtent().Size());
 
         float OptimalDistance = FMath::Clamp(MaxRadius * 2.0f, 1000.0f, 8000.0f);
         GPortalFrustumMaxDistance = OptimalDistance;
@@ -171,6 +159,16 @@ void FPortalViewExtension::PreRenderViewFamily_RenderThread(
             LastDistantScene = 1.0f;
         }
     }
+}
+
+void FPortalViewExtension::PostRenderBasePassDeferred_RenderThread(
+    FRDGBuilder& GraphBuilder,
+    FSceneView& InView,
+    const FRenderTargetBindingSlots& RenderTargets,
+    TRDGUniformBufferRef<FSceneTextureUniformParameters> SceneTextures)
+{
+    if (InView.bIsSceneCapture) return;
+    // 다음 단계: 스텐실=1 영역에 스트리밍 레벨 렌더 구현
 }
 
 void FPortalViewExtension::UpdatePortalData(const TArray<FBox>& InPortalBounds)

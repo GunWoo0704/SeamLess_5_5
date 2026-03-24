@@ -5,9 +5,10 @@
 #include "GameFramework/Pawn.h"
 #include "IXRTrackingSystem.h"
 #include "Engine/Engine.h"
-#include "DrawDebugHelpers.h"
 #include "Engine/World.h"
+#include "Engine/LevelStreamingDynamic.h"
 #include "EngineUtils.h"
+#include "DrawDebugHelpers.h"
 
 APortalActor::APortalActor()
 {
@@ -36,6 +37,9 @@ APortalActor::APortalActor()
     TriggerVolume->SetCollisionObjectType(ECollisionChannel::ECC_WorldDynamic);
     TriggerVolume->SetCollisionResponseToAllChannels(ECollisionResponse::ECR_Overlap);
     TriggerVolume->SetGenerateOverlapEvents(true);
+
+    // 기본 카메라 위치 (눈높이)
+    TargetCaptureLocation = FVector::ZeroVector;
 }
 
 void APortalActor::BeginPlay()
@@ -44,7 +48,9 @@ void APortalActor::BeginPlay()
 
     ViewExtension = FSceneViewExtensions::NewExtension<FPortalViewExtension>();
 
-    // 초기 액터 Bounds 캐시 수집
+    PortalMesh->SetRenderCustomDepth(true);
+    PortalMesh->SetCustomDepthStencilValue(1);
+
     CacheSceneActorBounds();
 
     if (!RenderTarget)
@@ -71,15 +77,54 @@ void APortalActor::BeginPlay()
     }
 
     TriggerVolume->OnComponentBeginOverlap.AddDynamic(this, &APortalActor::OnOverlapBegin);
+
+    if (!TargetLevel.IsNull())
+        LoadTargetLevel();
+}
+
+void APortalActor::LoadTargetLevel()
+{
+    bool bSuccess = false;
+    StreamingLevel = ULevelStreamingDynamic::LoadLevelInstanceBySoftObjectPtr(
+        GetWorld(),
+        TargetLevel,
+        TargetViewTransform.GetLocation(),
+        TargetViewTransform.GetRotation().Rotator(),
+        bSuccess
+    );
+
+    if (StreamingLevel && bSuccess)
+    {
+        StreamingLevel->OnLevelLoaded.AddDynamic(this, &APortalActor::OnTargetLevelLoaded);
+    }
+    else
+    {
+        UE_LOG(LogTemp, Warning, TEXT("PortalActor: TargetLevel load failed"));
+    }
+}
+
+void APortalActor::OnTargetLevelLoaded()
+{
+    ULevel* LoadedLevel = StreamingLevel->GetLoadedLevel();
+    if (!LoadedLevel) return;
+
+    StreamingLevelActors.Reset();
+    for (AActor* Actor : LoadedLevel->Actors)
+    {
+        if (!Actor) continue;
+        StreamingLevelActors.Add(Actor);
+    }
+
+    UE_LOG(LogTemp, Log, TEXT("PortalActor: TargetLevel loaded, actors: %d"),
+        StreamingLevelActors.Num());
 }
 
 void APortalActor::Tick(float DeltaTime)
 {
     Super::Tick(DeltaTime);
 
-    if (!LinkedPortal || !ViewExtension.IsValid()) return;
+    if (!ViewExtension.IsValid()) return;
 
-    // 0.5초마다 액터 Bounds 갱신 (매 프레임 아님)
     ActorBoundsCacheTimer += DeltaTime;
     if (ActorBoundsCacheTimer >= ActorBoundsCacheInterval)
     {
@@ -88,12 +133,26 @@ void APortalActor::Tick(float DeltaTime)
     }
 
     UpdatePortalFrustumData();
-    UpdateSceneCapture();
 
-    // 플레이어가 Portal에서 500cm 이내일 때만 캡처
     APawn* PlayerPawn = UGameplayStatics::GetPlayerPawn(GetWorld(), 0);
-    if (PlayerPawn)
+    if (!PlayerPawn) return;
+
+    UCameraComponent* Camera = PlayerPawn->FindComponentByClass<UCameraComponent>();
+    if (!Camera) return;
+
+    if (!TargetLevel.IsNull() && StreamingLevel && StreamingLevel->GetLoadedLevel())
     {
+        // TargetCaptureLocation 위치에서 플레이어 회전 방향으로 찍기
+        FRotator PlayerRot = Camera->GetComponentRotation();
+        SceneCapture->SetWorldLocationAndRotation(
+            TargetCaptureLocation,
+            PlayerRot);
+        SceneCapture->CaptureScene();
+    }
+    else if (LinkedPortal)
+    {
+        UpdateSceneCapture();
+
         float DistToPortal = FVector::Dist(
             PlayerPawn->GetActorLocation(),
             GetActorLocation());
@@ -135,7 +194,6 @@ void APortalActor::UpdatePortalFrustumData()
     FVector PortalCenter = PortalMesh->GetComponentLocation();
     FVector Right = PortalMesh->GetRightVector();
     FVector Up = PortalMesh->GetUpVector();
-
     FVector Scale = PortalMesh->GetComponentScale();
     float HalfWidth = 50.0f * Scale.Y;
     float HalfHeight = 50.0f * Scale.Z;
@@ -161,27 +219,25 @@ void APortalActor::UpdateSceneCapture()
     UCameraComponent* Camera = PlayerPawn->FindComponentByClass<UCameraComponent>();
     if (!Camera) return;
 
-    FVector CameraLocation = Camera->GetComponentLocation();
+    FVector  CameraLocation = Camera->GetComponentLocation();
     FRotator CameraRotation = Camera->GetComponentRotation();
 
     FTransform ThisTransform = GetActorTransform();
     FVector LocalPos = ThisTransform.InverseTransformPosition(CameraLocation);
-    FQuat LocalRot = ThisTransform.InverseTransformRotation(CameraRotation.Quaternion());
+    FQuat   LocalRot = ThisTransform.InverseTransformRotation(CameraRotation.Quaternion());
 
     LocalPos.X = -LocalPos.X;
     LocalRot = FQuat(FVector::UpVector, PI) * LocalRot;
 
     FTransform LinkedTransform = LinkedPortal->GetActorTransform();
     FVector TargetPos = LinkedTransform.TransformPosition(LocalPos);
-    FQuat TargetRot = LinkedTransform.TransformRotation(LocalRot);
+    FQuat   TargetRot = LinkedTransform.TransformRotation(LocalRot);
 
     SceneCapture->SetWorldLocationAndRotation(TargetPos, TargetRot.Rotator());
 
     APlayerCameraManager* CameraManager = UGameplayStatics::GetPlayerCameraManager(GetWorld(), 0);
     if (CameraManager)
-    {
         SceneCapture->FOVAngle = CameraManager->GetFOVAngle();
-    }
 }
 
 void APortalActor::OnOverlapBegin(UPrimitiveComponent* OverlappedComp,
@@ -200,11 +256,11 @@ void APortalActor::OnOverlapBegin(UPrimitiveComponent* OverlappedComp,
 
     FTransform ThisTransform = GetActorTransform();
     FVector LocalPosition = ThisTransform.InverseTransformPosition(Pawn->GetActorLocation());
-    FQuat LocalRotation = ThisTransform.InverseTransformRotation(Pawn->GetActorRotation().Quaternion());
+    FQuat   LocalRotation = ThisTransform.InverseTransformRotation(Pawn->GetActorRotation().Quaternion());
 
     FTransform LinkedTransform = LinkedPortal->GetActorTransform();
     FVector NewPosition = LinkedTransform.TransformPosition(LocalPosition);
-    FQuat NewRotation = LinkedTransform.TransformRotation(LocalRotation);
+    FQuat   NewRotation = LinkedTransform.TransformRotation(LocalRotation);
 
     FRotator FinalRotation = NewRotation.Rotator();
     FinalRotation.Yaw += 180.0f;

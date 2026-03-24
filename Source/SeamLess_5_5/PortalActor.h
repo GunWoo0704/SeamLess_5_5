@@ -9,6 +9,7 @@
 #include "Materials/MaterialInterface.h"
 #include "Materials/MaterialInstanceDynamic.h"
 #include "Engine/Scene.h"
+#include "Engine/LevelStreamingDynamic.h"
 #include "SceneViewExtension.h"
 #include "PortalViewExtension.h"
 #include "PortalActor.generated.h"
@@ -42,6 +43,17 @@ public:
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Portal")
     UTextureRenderTarget2D* RenderTarget;
 
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Portal|Target")
+    TSoftObjectPtr<UWorld> TargetLevel;
+
+    // 타겟 레벨 로드 기준 위치/회전
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Portal|Target")
+    FTransform TargetViewTransform;
+
+    // 포탈 안에서 SceneCapture가 찍을 위치 (카메라 눈높이)
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Portal|Target")
+    FVector TargetCaptureLocation;
+
     virtual void Tick(float DeltaTime) override;
     virtual void BeginPlay() override;
 
@@ -54,17 +66,25 @@ protected:
         bool bFromSweep,
         const FHitResult& SweepResult);
 
+    UFUNCTION()
+    void OnTargetLevelLoaded();
+
 private:
     void UpdateSceneCapture();
     void UpdatePortalFrustumData();
-    void CacheSceneActorBounds();  // 추가
+    void CacheSceneActorBounds();
+    void LoadTargetLevel();
 
     UPROPERTY()
     UMaterialInstanceDynamic* DynamicMaterial;
 
+    UPROPERTY()
+    ULevelStreamingDynamic* StreamingLevel = nullptr;
+
+    TArray<AActor*> StreamingLevelActors;
+
     TSharedPtr<FPortalViewExtension, ESPMode::ThreadSafe> ViewExtension;
 
-    // 액터 Bounds 캐시
     TArray<FBoxSphereBounds> CachedActorBounds;
     float ActorBoundsCacheTimer = 0.0f;
     static constexpr float ActorBoundsCacheInterval = 0.5f;
