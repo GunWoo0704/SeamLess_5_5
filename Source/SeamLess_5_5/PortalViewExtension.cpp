@@ -11,16 +11,6 @@ FPortalViewExtension::FPortalViewExtension(const FAutoRegister& AutoRegister)
 
 FPortalViewExtension::~FPortalViewExtension()
 {
-    static IConsoleVariable* CVarLumenSceneViewDistance =
-        IConsoleManager::Get().FindConsoleVariable(TEXT("r.LumenScene.ViewDistance"));
-    static IConsoleVariable* CVarLumenDistantScene =
-        IConsoleManager::Get().FindConsoleVariable(TEXT("r.Lumen.DistantScene.Enable"));
-
-    if (CVarLumenSceneViewDistance)
-        CVarLumenSceneViewDistance->Set(10000.0f, ECVF_SetByCode);
-    if (CVarLumenDistantScene)
-        CVarLumenDistantScene->Set(1, ECVF_SetByCode);
-
     extern RENDERER_API float GPortalFrustumMaxDistance;
     GPortalFrustumMaxDistance = 0.0f;
 }
@@ -74,7 +64,7 @@ float FPortalViewExtension::ComputeOptimalLumenDistance(
         }
     }
 
-    return FMath::Clamp(MaxDist * 1.5f, 1000.0f, 8000.0f);
+    return FMath::Clamp(MaxDist * 1.5f, 500.0f, 2000.0f);
 }
 
 void FPortalViewExtension::PreRenderViewFamily_RenderThread(
@@ -88,35 +78,24 @@ void FPortalViewExtension::PreRenderViewFamily_RenderThread(
 
     extern RENDERER_API float GPortalFrustumMaxDistance;
 
-    static IConsoleVariable* CVarLumenSceneViewDistance =
-        IConsoleManager::Get().FindConsoleVariable(TEXT("r.LumenScene.ViewDistance"));
-    static IConsoleVariable* CVarLumenDistantScene =
-        IConsoleManager::Get().FindConsoleVariable(TEXT("r.Lumen.DistantScene.Enable"));
-
     static float LastOptimalDistance = -1.0f;
-    static float LastDistantScene = -1.0f;
 
-    if (PortalFrustum.bIsValid && SceneActorBounds.Num() > 0)
+    if (PortalFrustum.bIsValid)
     {
-        FConvexVolume PortalVolume;
-        BuildPortalConvexVolume(PortalFrustum.EyePosition, PortalFrustum.Corners, PortalVolume);
-
-        float OptimalDistance = ComputeOptimalLumenDistance(PortalVolume, PortalFrustum.EyePosition);
-        GPortalFrustumMaxDistance = OptimalDistance;
-
-        if (FMath::Abs(OptimalDistance - LastOptimalDistance) > 100.0f)
+        if (SceneActorBounds.Num() > 0)
         {
-            if (CVarLumenSceneViewDistance)
-                CVarLumenSceneViewDistance->Set(OptimalDistance, ECVF_SetByCode);
-            LastOptimalDistance = OptimalDistance;
+            FConvexVolume PortalVolume;
+            BuildPortalConvexVolume(PortalFrustum.EyePosition, PortalFrustum.Corners, PortalVolume);
+            float OptimalDistance = ComputeOptimalLumenDistance(PortalVolume, PortalFrustum.EyePosition);
+            GPortalFrustumMaxDistance = OptimalDistance;
+        }
+        else
+        {
+            // 바운드 없으면 기본 제한값 적용
+            GPortalFrustumMaxDistance = 1500.0f;
         }
 
-        if (LastDistantScene != 0.0f)
-        {
-            if (CVarLumenDistantScene)
-                CVarLumenDistantScene->Set(0, ECVF_SetByCode);
-            LastDistantScene = 0.0f;
-        }
+        UE_LOG(LogTemp, Log, TEXT("PortalFrustum ACTIVE - GPortalFrustumMaxDistance: %f"), GPortalFrustumMaxDistance);
     }
     else if (PortalVisibleBounds.Num() > 0)
     {
@@ -127,37 +106,16 @@ void FPortalViewExtension::PreRenderViewFamily_RenderThread(
         float OptimalDistance = FMath::Clamp(MaxRadius * 2.0f, 1000.0f, 8000.0f);
         GPortalFrustumMaxDistance = OptimalDistance;
 
-        if (FMath::Abs(OptimalDistance - LastOptimalDistance) > 100.0f)
-        {
-            if (CVarLumenSceneViewDistance)
-                CVarLumenSceneViewDistance->Set(OptimalDistance, ECVF_SetByCode);
-            LastOptimalDistance = OptimalDistance;
-        }
+        UE_LOG(LogTemp, Log, TEXT("PortalBounds ACTIVE - GPortalFrustumMaxDistance: %f"), GPortalFrustumMaxDistance);
 
-        if (LastDistantScene != 0.0f)
-        {
-            if (CVarLumenDistantScene)
-                CVarLumenDistantScene->Set(0, ECVF_SetByCode);
-            LastDistantScene = 0.0f;
-        }
+        LastOptimalDistance = OptimalDistance;
     }
     else
     {
         GPortalFrustumMaxDistance = 0.0f;
+        LastOptimalDistance = 0.0f;
 
-        if (LastOptimalDistance != 10000.0f)
-        {
-            if (CVarLumenSceneViewDistance)
-                CVarLumenSceneViewDistance->Set(10000.0f, ECVF_SetByCode);
-            LastOptimalDistance = 10000.0f;
-        }
-
-        if (LastDistantScene != 1.0f)
-        {
-            if (CVarLumenDistantScene)
-                CVarLumenDistantScene->Set(1, ECVF_SetByCode);
-            LastDistantScene = 1.0f;
-        }
+        UE_LOG(LogTemp, Log, TEXT("Portal INACTIVE - GPortalFrustumMaxDistance: 0"));
     }
 }
 
@@ -168,7 +126,6 @@ void FPortalViewExtension::PostRenderBasePassDeferred_RenderThread(
     TRDGUniformBufferRef<FSceneTextureUniformParameters> SceneTextures)
 {
     if (InView.bIsSceneCapture) return;
-    // 다음 단계: 스텐실=1 영역에 스트리밍 레벨 렌더 구현
 }
 
 void FPortalViewExtension::UpdatePortalData(const TArray<FBox>& InPortalBounds)

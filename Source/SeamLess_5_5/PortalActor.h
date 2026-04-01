@@ -74,6 +74,7 @@ private:
     void UpdatePortalFrustumData();
     void CacheSceneActorBounds();
     void LoadTargetLevel();
+    void UpdateStreamingLevelBounds(); // 이거 추가
 
     UPROPERTY()
     UMaterialInstanceDynamic* DynamicMaterial;

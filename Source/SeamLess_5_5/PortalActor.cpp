@@ -38,7 +38,6 @@ APortalActor::APortalActor()
     TriggerVolume->SetCollisionResponseToAllChannels(ECollisionResponse::ECR_Overlap);
     TriggerVolume->SetGenerateOverlapEvents(true);
 
-    // 기본 카메라 위치 (눈높이)
     TargetCaptureLocation = FVector::ZeroVector;
 }
 
@@ -50,8 +49,6 @@ void APortalActor::BeginPlay()
 
     PortalMesh->SetRenderCustomDepth(true);
     PortalMesh->SetCustomDepthStencilValue(1);
-
-    CacheSceneActorBounds();
 
     if (!RenderTarget)
     {
@@ -119,17 +116,65 @@ void APortalActor::OnTargetLevelLoaded()
         StreamingLevelActors.Num());
 }
 
+void APortalActor::UpdateStreamingLevelBounds()
+{
+    if (!ViewExtension.IsValid()) return;
+
+    TArray<FBoxSphereBounds> StreamingBounds;
+    for (AActor* Actor : StreamingLevelActors)
+    {
+        if (!Actor || !Actor->GetRootComponent()) continue;
+        FBox Box = Actor->GetComponentsBoundingBox(true);
+        if (Box.IsValid && Box.GetExtent().SizeSquared() > 0.0f)
+            StreamingBounds.Add(FBoxSphereBounds(Box));
+    }
+
+    ViewExtension->UpdateSceneActorBounds(StreamingBounds);
+
+    UE_LOG(LogTemp, Log, TEXT("PortalActor: StreamingLevel bounds updated: %d actors"),
+        StreamingBounds.Num());
+}
+
 void APortalActor::Tick(float DeltaTime)
 {
     Super::Tick(DeltaTime);
 
     if (!ViewExtension.IsValid()) return;
 
-    ActorBoundsCacheTimer += DeltaTime;
-    if (ActorBoundsCacheTimer >= ActorBoundsCacheInterval)
+    // StreamingLevel 로드됐는데 바운드가 아직 없는 경우 계속 시도
+    if (StreamingLevel && StreamingLevel->GetLoadedLevel() && ViewExtension.IsValid())
     {
-        ActorBoundsCacheTimer = 0.0f;
-        CacheSceneActorBounds();
+        ULevel* LoadedLevel = StreamingLevel->GetLoadedLevel();
+
+        // 액터 수집
+        if (StreamingLevelActors.Num() == 0)
+        {
+            for (AActor* Actor : LoadedLevel->Actors)
+            {
+                if (!Actor) continue;
+                StreamingLevelActors.Add(Actor);
+            }
+        }
+
+        // 바운드 수집 - 유효한 Box가 생길 때까지 매 프레임 시도
+        if (StreamingLevelActors.Num() > 0)
+        {
+            TArray<FBoxSphereBounds> StreamingBounds;
+            for (AActor* Actor : StreamingLevelActors)
+            {
+                if (!Actor || !Actor->GetRootComponent()) continue;
+                FBox Box = Actor->GetComponentsBoundingBox(true);
+                if (Box.IsValid && Box.GetExtent().SizeSquared() > 0.0f)
+                    StreamingBounds.Add(FBoxSphereBounds(Box));
+            }
+
+            if (StreamingBounds.Num() > 0)
+            {
+                ViewExtension->UpdateSceneActorBounds(StreamingBounds);
+                UE_LOG(LogTemp, Log, TEXT("PortalActor: Bounds collected - %d / %d actors"),
+                    StreamingBounds.Num(), StreamingLevelActors.Num());
+            }
+        }
     }
 
     UpdatePortalFrustumData();
@@ -142,7 +187,6 @@ void APortalActor::Tick(float DeltaTime)
 
     if (!TargetLevel.IsNull() && StreamingLevel && StreamingLevel->GetLoadedLevel())
     {
-        // TargetCaptureLocation 위치에서 플레이어 회전 방향으로 찍기
         FRotator PlayerRot = Camera->GetComponentRotation();
         SceneCapture->SetWorldLocationAndRotation(
             TargetCaptureLocation,
@@ -160,22 +204,6 @@ void APortalActor::Tick(float DeltaTime)
         if (DistToPortal < 500.0f)
             SceneCapture->CaptureScene();
     }
-}
-
-void APortalActor::CacheSceneActorBounds()
-{
-    CachedActorBounds.Reset();
-    for (TActorIterator<AActor> It(GetWorld()); It; ++It)
-    {
-        AActor* Actor = *It;
-        if (Actor && Actor != this && Actor->GetRootComponent())
-        {
-            FBox Box = Actor->GetComponentsBoundingBox();
-            if (Box.IsValid)
-                CachedActorBounds.Add(FBoxSphereBounds(Box));
-        }
-    }
-    ViewExtension->UpdateSceneActorBounds(CachedActorBounds);
 }
 
 void APortalActor::UpdatePortalFrustumData()
