@@ -12,7 +12,9 @@ FPortalViewExtension::FPortalViewExtension(const FAutoRegister& AutoRegister)
 FPortalViewExtension::~FPortalViewExtension()
 {
     extern RENDERER_API float GPortalFrustumMaxDistance;
+    extern RENDERER_API int32 GPortalFrustumPlaneCount;
     GPortalFrustumMaxDistance = 0.0f;
+    GPortalFrustumPlaneCount = 0;
 }
 
 void FPortalViewExtension::SetupViewFamily(FSceneViewFamily& InViewFamily)
@@ -53,18 +55,18 @@ float FPortalViewExtension::ComputeOptimalLumenDistance(
     const FConvexVolume& PortalVolume,
     const FVector& EyePos)
 {
-    float MaxDist = 1000.0f;
+    float MaxDist = 500.0f;
 
     for (const FBoxSphereBounds& Bounds : SceneActorBounds)
     {
         if (PortalVolume.IntersectSphere(Bounds.Origin, Bounds.SphereRadius))
         {
-            float Dist = FVector::Dist(EyePos, Bounds.Origin) + Bounds.SphereRadius;
+            float Dist = Bounds.SphereRadius * 2.0f;
             MaxDist = FMath::Max(MaxDist, Dist);
         }
     }
 
-    return FMath::Clamp(MaxDist * 1.5f, 500.0f, 2000.0f);
+    return FMath::Clamp(MaxDist, 300.0f, 1500.0f);
 }
 
 void FPortalViewExtension::PreRenderViewFamily_RenderThread(
@@ -77,45 +79,42 @@ void FPortalViewExtension::PreRenderViewFamily_RenderThread(
     FScopeLock Lock(&DataLock);
 
     extern RENDERER_API float GPortalFrustumMaxDistance;
-
-    static float LastOptimalDistance = -1.0f;
+    extern RENDERER_API FPlane GPortalFrustumPlanes[5];
+    extern RENDERER_API int32 GPortalFrustumPlaneCount;
 
     if (PortalFrustum.bIsValid)
     {
+        FConvexVolume PortalVolume;
+        BuildPortalConvexVolume(PortalFrustum.EyePosition, PortalFrustum.Corners, PortalVolume);
+
+        // 평면 데이터를 전역 변수에 전달
+        int32 PlaneCount = FMath::Min(PortalVolume.Planes.Num(), 5);
+        for (int32 i = 0; i < PlaneCount; i++)
+        {
+            GPortalFrustumPlanes[i] = PortalVolume.Planes[i];
+        }
+        GPortalFrustumPlaneCount = PlaneCount;
+
+        // 거리 제한도 함께 설정
         if (SceneActorBounds.Num() > 0)
         {
-            FConvexVolume PortalVolume;
-            BuildPortalConvexVolume(PortalFrustum.EyePosition, PortalFrustum.Corners, PortalVolume);
             float OptimalDistance = ComputeOptimalLumenDistance(PortalVolume, PortalFrustum.EyePosition);
             GPortalFrustumMaxDistance = OptimalDistance;
         }
         else
         {
-            // 바운드 없으면 기본 제한값 적용
             GPortalFrustumMaxDistance = 1500.0f;
         }
 
-        UE_LOG(LogTemp, Log, TEXT("PortalFrustum ACTIVE - GPortalFrustumMaxDistance: %f"), GPortalFrustumMaxDistance);
-    }
-    else if (PortalVisibleBounds.Num() > 0)
-    {
-        float MaxRadius = 0.0f;
-        for (const FBox& Box : PortalVisibleBounds)
-            MaxRadius = FMath::Max(MaxRadius, Box.GetExtent().Size());
-
-        float OptimalDistance = FMath::Clamp(MaxRadius * 2.0f, 1000.0f, 8000.0f);
-        GPortalFrustumMaxDistance = OptimalDistance;
-
-        UE_LOG(LogTemp, Log, TEXT("PortalBounds ACTIVE - GPortalFrustumMaxDistance: %f"), GPortalFrustumMaxDistance);
-
-        LastOptimalDistance = OptimalDistance;
+        UE_LOG(LogTemp, Log, TEXT("PortalFrustum ACTIVE - Planes: %d, MaxDist: %f"),
+            GPortalFrustumPlaneCount, GPortalFrustumMaxDistance);
     }
     else
     {
         GPortalFrustumMaxDistance = 0.0f;
-        LastOptimalDistance = 0.0f;
+        GPortalFrustumPlaneCount = 0;
 
-        UE_LOG(LogTemp, Log, TEXT("Portal INACTIVE - GPortalFrustumMaxDistance: 0"));
+        UE_LOG(LogTemp, Log, TEXT("Portal INACTIVE"));
     }
 }
 
