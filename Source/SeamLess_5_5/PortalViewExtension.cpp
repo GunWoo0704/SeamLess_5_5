@@ -4,6 +4,14 @@
 #include "RendererInterface.h"
 #include "SceneView.h"
 
+// ë²¤ì¹˜ë§ˆí¬ìš© í† ê¸€ â€” ì½˜ì†”ì—ì„œ r.Portal.FrustumCulling 0/1 ë¡œ ì¼œê³  ë„ê¸°
+static TAutoConsoleVariable<int32> CVarPortalFrustumCulling(
+    TEXT("r.Portal.FrustumCulling"),
+    1,
+    TEXT("0: Portal Frustum Culling ë¹„í™œì„±í™” (Baseline)\n1: Portal Frustum Culling í™œì„±í™” (ê¸°ë³¸ê°’)"),
+    ECVF_RenderThreadSafe
+);
+
 FPortalViewExtension::FPortalViewExtension(const FAutoRegister& AutoRegister)
     : FSceneViewExtensionBase(AutoRegister)
 {
@@ -82,12 +90,20 @@ void FPortalViewExtension::PreRenderViewFamily_RenderThread(
     extern RENDERER_API FPlane GPortalFrustumPlanes[5];
     extern RENDERER_API int32 GPortalFrustumPlaneCount;
 
+    // ë²¤ì¹˜ë§ˆí¬ í† ê¸€: r.Portal.FrustumCulling 0 ì´ë©´ Culling ë¹„í™œì„±í™”
+    if (CVarPortalFrustumCulling.GetValueOnRenderThread() == 0)
+    {
+        GPortalFrustumMaxDistance = 0.0f;
+        GPortalFrustumPlaneCount = 0;
+        return;
+    }
+
     if (PortalFrustum.bIsValid)
     {
         FConvexVolume PortalVolume;
         BuildPortalConvexVolume(PortalFrustum.EyePosition, PortalFrustum.Corners, PortalVolume);
 
-        // Æò¸é µ¥ÀÌÅÍ¸¦ Àü¿ª º¯¼ö¿¡ Àü´Ş
+        // ï¿½ï¿½ï¿½ ï¿½ï¿½ï¿½ï¿½ï¿½Í¸ï¿½ ï¿½ï¿½ï¿½ï¿½ ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ ï¿½ï¿½ï¿½ï¿½
         int32 PlaneCount = FMath::Min(PortalVolume.Planes.Num(), 5);
         for (int32 i = 0; i < PlaneCount; i++)
         {
@@ -95,7 +111,7 @@ void FPortalViewExtension::PreRenderViewFamily_RenderThread(
         }
         GPortalFrustumPlaneCount = PlaneCount;
 
-        // °Å¸® Á¦ÇÑµµ ÇÔ²² ¼³Á¤
+        // ï¿½Å¸ï¿½ ï¿½ï¿½ï¿½Ñµï¿½ ï¿½Ô²ï¿½ ï¿½ï¿½ï¿½ï¿½
         if (SceneActorBounds.Num() > 0)
         {
             float OptimalDistance = ComputeOptimalLumenDistance(PortalVolume, PortalFrustum.EyePosition);

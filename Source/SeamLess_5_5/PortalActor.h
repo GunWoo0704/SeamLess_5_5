@@ -46,13 +46,21 @@ public:
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Portal|Target")
     TSoftObjectPtr<UWorld> TargetLevel;
 
-    // Å¸°Ù ·¹º§ ·Îµå ±âÁØ À§Ä¡/È¸Àü
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Portal|Target")
     FTransform TargetViewTransform;
 
-    // Æ÷Å» ¾È¿¡¼­ SceneCapture°¡ ÂïÀ» À§Ä¡ (Ä«¸Ş¶ó ´«³ôÀÌ)
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Portal|Target")
     FVector TargetCaptureLocation;
+
+    // ===== ìŠ¤í…ì‹¤ ë²„í¼ í¬íƒˆ ë§ˆìŠ¤í‚¹ =====
+
+    /** ìŠ¤í…ì‹¤ ê¸°ë°˜ í¬íƒˆ ë§ˆìŠ¤í‚¹ìš© Post Process ë¨¸í‹°ë¦¬ì–¼ (ì—ë””í„°ì—ì„œ í• ë‹¹) */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Portal|Stencil")
+    UMaterialInterface* StencilPostProcessMaterial;
+
+    /** í¬íƒˆ ë©”ì‹œì˜ Custom Stencil ê°’ (ê¸°ë³¸ 1) */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Portal|Stencil")
+    int32 PortalStencilValue = 1;
 
     virtual void Tick(float DeltaTime) override;
     virtual void BeginPlay() override;
@@ -74,10 +82,14 @@ private:
     void UpdatePortalFrustumData();
     void CacheSceneActorBounds();
     void LoadTargetLevel();
-    void UpdateStreamingLevelBounds(); // ÀÌ°Å Ãß°¡
+    void UpdateStreamingLevelBounds();
+    void BindStencilMaterialToVolume();
 
     UPROPERTY()
     UMaterialInstanceDynamic* DynamicMaterial;
+
+    UPROPERTY()
+    UMaterialInstanceDynamic* StencilPPInstance = nullptr;
 
     UPROPERTY()
     ULevelStreamingDynamic* StreamingLevel = nullptr;

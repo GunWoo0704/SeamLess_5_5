@@ -7,6 +7,7 @@
 #include "Engine/Engine.h"
 #include "Engine/World.h"
 #include "Engine/LevelStreamingDynamic.h"
+#include "Engine/PostProcessVolume.h"
 #include "EngineUtils.h"
 #include "DrawDebugHelpers.h"
 
@@ -47,9 +48,11 @@ void APortalActor::BeginPlay()
 
     ViewExtension = FSceneViewExtensions::NewExtension<FPortalViewExtension>();
 
+    // 포탈 메시: Custom Depth + Stencil 활성화
     PortalMesh->SetRenderCustomDepth(true);
-    PortalMesh->SetCustomDepthStencilValue(1);
+    PortalMesh->SetCustomDepthStencilValue(PortalStencilValue);
 
+    // 렌더 타겟 생성
     if (!RenderTarget)
     {
         RenderTarget = NewObject<UTextureRenderTarget2D>(this);
@@ -59,12 +62,17 @@ void APortalActor::BeginPlay()
     }
 
     SceneCapture->TextureTarget = RenderTarget;
+    SceneCapture->FOVAngle = 104.0f;  // Quest 3 HMD FOV
     SceneCapture->ShowFlags.SetAtmosphere(true);
     SceneCapture->ShowFlags.SetSkyLighting(true);
     SceneCapture->ShowFlags.SetFog(true);
     SceneCapture->ShowFlags.SetVolumetricFog(true);
     SceneCapture->ShowFlags.SetDynamicShadows(true);
 
+    // 포탈 면을 클립 플레인으로 설정 — 포탈 너머 세계만 캡처
+    SceneCapture->bEnableClipPlane = true;
+
+    // 포탈 메시 머티리얼 설정
     if (PortalMaterial)
     {
         DynamicMaterial = UMaterialInstanceDynamic::Create(PortalMaterial, this);
@@ -73,10 +81,42 @@ void APortalActor::BeginPlay()
         PortalMesh->SetMaterial(0, DynamicMaterial);
     }
 
+    // 스텐실 PP는 일단 비활성화 - 메시 머티리얼로 포탈 표시 확인 후 활성화
+    // BindStencilMaterialToVolume();
+
     TriggerVolume->OnComponentBeginOverlap.AddDynamic(this, &APortalActor::OnOverlapBegin);
 
     if (!TargetLevel.IsNull())
         LoadTargetLevel();
+}
+
+void APortalActor::BindStencilMaterialToVolume()
+{
+    if (!StencilPostProcessMaterial || !RenderTarget)
+    {
+        UE_LOG(LogTemp, Warning, TEXT("PortalActor: StencilPostProcessMaterial or RenderTarget not set"));
+        return;
+    }
+
+    // PP 머티리얼 다이내믹 인스턴스 생성
+    StencilPPInstance = UMaterialInstanceDynamic::Create(StencilPostProcessMaterial, this);
+    StencilPPInstance->SetTextureParameterValue(FName("PortalRT"), RenderTarget);
+
+    // 레벨에 있는 PostProcessVolume 찾기
+    for (TActorIterator<APostProcessVolume> It(GetWorld()); It; ++It)
+    {
+        APostProcessVolume* PPVolume = *It;
+        if (PPVolume && PPVolume->bUnbound)
+        {
+            PPVolume->Settings.WeightedBlendables.Array.Add(
+                FWeightedBlendable(1.0f, StencilPPInstance));
+
+            UE_LOG(LogTemp, Log, TEXT("PortalActor: Stencil PP bound to existing PostProcessVolume"));
+            return;
+        }
+    }
+
+    UE_LOG(LogTemp, Warning, TEXT("PortalActor: No unbound PostProcessVolume found! Place one in the level with Infinite Extent enabled."));
 }
 
 void APortalActor::LoadTargetLevel()
@@ -141,12 +181,11 @@ void APortalActor::Tick(float DeltaTime)
 
     if (!ViewExtension.IsValid()) return;
 
-    // StreamingLevel �ε�ƴµ� �ٿ�尡 ���� ���� ��� ��� �õ�
+    // StreamingLevel 바운드 수집
     if (StreamingLevel && StreamingLevel->GetLoadedLevel() && ViewExtension.IsValid())
     {
         ULevel* LoadedLevel = StreamingLevel->GetLoadedLevel();
 
-        // ���� ����
         if (StreamingLevelActors.Num() == 0)
         {
             for (AActor* Actor : LoadedLevel->Actors)
@@ -156,7 +195,6 @@ void APortalActor::Tick(float DeltaTime)
             }
         }
 
-        // �ٿ�� ���� - ��ȿ�� Box�� ���� ������ �� ������ �õ�
         if (StreamingLevelActors.Num() > 0)
         {
             TArray<FBoxSphereBounds> StreamingBounds;
@@ -171,8 +209,6 @@ void APortalActor::Tick(float DeltaTime)
             if (StreamingBounds.Num() > 0)
             {
                 ViewExtension->UpdateSceneActorBounds(StreamingBounds);
-                UE_LOG(LogTemp, Log, TEXT("PortalActor: Bounds collected - %d / %d actors"),
-                    StreamingBounds.Num(), StreamingLevelActors.Num());
             }
         }
     }
@@ -187,6 +223,12 @@ void APortalActor::Tick(float DeltaTime)
 
     if (!TargetLevel.IsNull() && StreamingLevel && StreamingLevel->GetLoadedLevel())
     {
+        SceneCapture->FOVAngle = 104.0f;
+
+        // 클립 플레인: 포탈 면의 위치와 법선 (포탈 너머만 캡처)
+        SceneCapture->ClipPlaneBase = TargetCaptureLocation;
+        SceneCapture->ClipPlaneNormal = -GetActorForwardVector();
+
         FRotator PlayerRot = Camera->GetComponentRotation();
         SceneCapture->SetWorldLocationAndRotation(
             TargetCaptureLocation,
@@ -263,9 +305,11 @@ void APortalActor::UpdateSceneCapture()
 
     SceneCapture->SetWorldLocationAndRotation(TargetPos, TargetRot.Rotator());
 
-    APlayerCameraManager* CameraManager = UGameplayStatics::GetPlayerCameraManager(GetWorld(), 0);
-    if (CameraManager)
-        SceneCapture->FOVAngle = CameraManager->GetFOVAngle();
+    SceneCapture->FOVAngle = 104.0f;
+
+    // 클립 플레인: LinkedPortal 면 기준으로 너머만 캡처
+    SceneCapture->ClipPlaneBase = LinkedPortal->GetActorLocation();
+    SceneCapture->ClipPlaneNormal = -LinkedPortal->GetActorForwardVector();
 }
 
 void APortalActor::OnOverlapBegin(UPrimitiveComponent* OverlappedComp,
@@ -276,11 +320,28 @@ void APortalActor::OnOverlapBegin(UPrimitiveComponent* OverlappedComp,
     const FHitResult& SweepResult)
 {
     APawn* Pawn = Cast<APawn>(OtherActor);
-    if (!Pawn || !LinkedPortal) return;
+    if (!Pawn) return;
 
+    // 포탈 앞면에서 진입했는지 확인 (뒤에서 진입 방지)
     FVector ToPlayer = Pawn->GetActorLocation() - GetActorLocation();
     float Dot = FVector::DotProduct(ToPlayer, GetActorForwardVector());
     if (Dot < 0.0f) return;
+
+    // 모드 1: TargetLevel (스트리밍 레벨로 순간이동)
+    if (!TargetLevel.IsNull() && StreamingLevel && StreamingLevel->GetLoadedLevel())
+    {
+        FVector TeleportLocation = TargetViewTransform.GetLocation();
+        FRotator TeleportRotation = TargetViewTransform.GetRotation().Rotator();
+
+        Pawn->SetActorLocationAndRotation(TeleportLocation, TeleportRotation);
+
+        UE_LOG(LogTemp, Log, TEXT("PortalActor: Teleported to TargetLevel at %s"),
+            *TeleportLocation.ToString());
+        return;
+    }
+
+    // 모드 2: LinkedPortal (같은 레벨 내 포탈 간 이동)
+    if (!LinkedPortal) return;
 
     FTransform ThisTransform = GetActorTransform();
     FVector LocalPosition = ThisTransform.InverseTransformPosition(Pawn->GetActorLocation());
@@ -294,4 +355,6 @@ void APortalActor::OnOverlapBegin(UPrimitiveComponent* OverlappedComp,
     FinalRotation.Yaw += 180.0f;
 
     Pawn->SetActorLocationAndRotation(NewPosition, FinalRotation);
+
+    UE_LOG(LogTemp, Log, TEXT("PortalActor: Teleported to LinkedPortal"));
 }
