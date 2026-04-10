@@ -14,6 +14,8 @@
 #include "PortalViewExtension.h"
 #include "PortalActor.generated.h"
 
+class UCameraComponent;
+
 UCLASS()
 class SEAMLESS_5_5_API APortalActor : public AActor
 {
@@ -84,6 +86,11 @@ private:
     void LoadTargetLevel();
     void UpdateStreamingLevelBounds();
     void BindStencilMaterialToVolume();
+    void CheckPortalCrossing(UCameraComponent* Camera);
+    void ExecuteTeleport(APawn* Pawn);
+
+    // 포탈 평면 통과 감지용 — 이전 프레임 부호 저장
+    int32 LastDotSign = 0;
 
     UPROPERTY()
     UMaterialInstanceDynamic* DynamicMaterial;

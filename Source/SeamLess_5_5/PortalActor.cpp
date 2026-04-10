@@ -26,6 +26,8 @@ APortalActor::APortalActor()
 
     SceneCapture = CreateDefaultSubobject<USceneCaptureComponent2D>(TEXT("SceneCapture"));
     SceneCapture->SetupAttachment(PortalRoot);
+    // Lumen GI 누적을 위해 bCaptureEveryFrame은 Tick에서 동적으로 관리
+    // (근거리: true → Lumen Surface Cache 축적, 원거리: false → 성능)
     SceneCapture->bCaptureEveryFrame = false;
     SceneCapture->bCaptureOnMovement = false;
     SceneCapture->CaptureSource = ESceneCaptureSource::SCS_SceneColorHDR;
@@ -68,9 +70,35 @@ void APortalActor::BeginPlay()
     SceneCapture->ShowFlags.SetFog(true);
     SceneCapture->ShowFlags.SetVolumetricFog(true);
     SceneCapture->ShowFlags.SetDynamicShadows(true);
+    SceneCapture->ShowFlags.SetGlobalIllumination(true);
+    SceneCapture->ShowFlags.SetLumenGlobalIllumination(true);  // ← 핵심: 이게 없으면 ShouldRenderLumenDiffuseGI가 false 반환
+    SceneCapture->ShowFlags.SetLighting(true);
+    SceneCapture->ShowFlags.SetPostProcessing(true);
+    SceneCapture->ShowFlags.SetAmbientOcclusion(true);
+    SceneCapture->ShowFlags.SetLumenReflections(true);
+    SceneCapture->ShowFlags.SetIndirectLightingCache(true);
+    SceneCapture->ShowFlags.SetSkyLighting(true);
 
-    // 포탈 면을 클립 플레인으로 설정 — 포탈 너머 세계만 캡처
-    SceneCapture->bEnableClipPlane = true;
+    // Lumen GI 방식 명시적 설정 — FinalPostProcessSettings.DynamicGlobalIlluminationMethod == Lumen 조건 충족
+    SceneCapture->PostProcessSettings.bOverride_DynamicGlobalIlluminationMethod = true;
+    SceneCapture->PostProcessSettings.DynamicGlobalIlluminationMethod = EDynamicGlobalIlluminationMethod::Lumen;
+
+    // 노출 설정 — SceneCapture는 기본적으로 auto exposure가 꺼져 있어서 어둡게 나옴
+    // Min/Max를 같은 값으로 잠그면 씬 밝기와 어긋남 → 적절한 범위로 열어줌
+    SceneCapture->PostProcessSettings.bOverride_AutoExposureMethod = true;
+    SceneCapture->PostProcessSettings.AutoExposureMethod = AEM_Histogram;
+    SceneCapture->PostProcessSettings.bOverride_AutoExposureMinBrightness = true;
+    SceneCapture->PostProcessSettings.AutoExposureMinBrightness = 0.18f;  // 실내 씬 기준
+    SceneCapture->PostProcessSettings.bOverride_AutoExposureMaxBrightness = true;
+    SceneCapture->PostProcessSettings.AutoExposureMaxBrightness = 8.0f;
+    // SpeedUp/Down: SceneCapture는 매 프레임 재설정되므로 빠른 적응이 필요
+    SceneCapture->PostProcessSettings.bOverride_AutoExposureSpeedUp = true;
+    SceneCapture->PostProcessSettings.AutoExposureSpeedUp = 10.0f;
+    SceneCapture->PostProcessSettings.bOverride_AutoExposureSpeedDown = true;
+    SceneCapture->PostProcessSettings.AutoExposureSpeedDown = 10.0f;
+
+    // 클립 플레인: Tick에서 모드에 따라 동적으로 설정
+    SceneCapture->bEnableClipPlane = false;
 
     // 포탈 메시 머티리얼 설정
     if (PortalMaterial)
@@ -145,6 +173,9 @@ void APortalActor::OnTargetLevelLoaded()
     ULevel* LoadedLevel = StreamingLevel->GetLoadedLevel();
     if (!LoadedLevel) return;
 
+    // SceneCapture가 스트리밍 레벨을 볼 수 있도록 명시적으로 Visible 설정
+    StreamingLevel->SetShouldBeVisible(true);
+
     StreamingLevelActors.Reset();
     for (AActor* Actor : LoadedLevel->Actors)
     {
@@ -152,8 +183,9 @@ void APortalActor::OnTargetLevelLoaded()
         StreamingLevelActors.Add(Actor);
     }
 
-    UE_LOG(LogTemp, Log, TEXT("PortalActor: TargetLevel loaded, actors: %d"),
-        StreamingLevelActors.Num());
+    UE_LOG(LogTemp, Warning, TEXT("[Portal] TargetLevel loaded! Actors: %d | Level: %s"),
+        StreamingLevelActors.Num(),
+        *LoadedLevel->GetPathName());
 }
 
 void APortalActor::UpdateStreamingLevelBounds()
@@ -221,30 +253,46 @@ void APortalActor::Tick(float DeltaTime)
     UCameraComponent* Camera = PlayerPawn->FindComponentByClass<UCameraComponent>();
     if (!Camera) return;
 
+    // VR에서는 Overlap이 안 잡히는 경우가 많아서 Tick에서 직접 감지
+    CheckPortalCrossing(Camera);
+
+    float DistToPortal = FVector::Dist(
+        PlayerPawn->GetActorLocation(),
+        GetActorLocation());
+
+    // Lumen GI는 bCaptureEveryFrame=true 상태에서 연속 프레임을 통해 누적됨
+    // 수동 CaptureScene()은 Lumen 입장에서 매번 새 뷰 → GI 누적 안 됨
+    // 1000cm 이내: 매 프레임 캡처 (Lumen 누적), 이외: 캡처 정지 (성능)
+    const float CaptureRange = 1000.0f;
+    bool bShouldCapture = (DistToPortal < CaptureRange);
+    SceneCapture->bCaptureEveryFrame = bShouldCapture;
+
     if (!TargetLevel.IsNull() && StreamingLevel && StreamingLevel->GetLoadedLevel())
     {
         SceneCapture->FOVAngle = 104.0f;
+        SceneCapture->bEnableClipPlane = false;
 
-        // 클립 플레인: 포탈 면의 위치와 법선 (포탈 너머만 캡처)
-        SceneCapture->ClipPlaneBase = TargetCaptureLocation;
-        SceneCapture->ClipPlaneNormal = -GetActorForwardVector();
-
+        // TargetCaptureLocation = 레벨 안 카메라 위치 (에디터에서 직접 설정)
+        // TargetViewTransform = 레벨 스폰 위치 (BeginPlay에서만 사용)
         FRotator PlayerRot = Camera->GetComponentRotation();
-        SceneCapture->SetWorldLocationAndRotation(
-            TargetCaptureLocation,
-            PlayerRot);
-        SceneCapture->CaptureScene();
+        SceneCapture->SetWorldLocationAndRotation(TargetCaptureLocation, PlayerRot);
+
+        // 디버그: 매 60프레임마다 상태 출력
+        static int32 DebugFrame = 0;
+        if (++DebugFrame % 60 == 0)
+        {
+            UE_LOG(LogTemp, Warning, TEXT("[Portal] SceneCapture pos: %s | LoadedLevel actors: %d"),
+                *TargetCaptureLocation.ToString(),
+                StreamingLevel->GetLoadedLevel()->Actors.Num());
+            UE_LOG(LogTemp, Warning, TEXT("[Portal] LevelSpawn(TargetViewTransform): %s"),
+                *TargetViewTransform.GetLocation().ToString());
+        }
     }
     else if (LinkedPortal)
     {
+        // LinkedPortal 모드: 클립 플레인 활성화 (포탈 너머만 캡처)
+        SceneCapture->bEnableClipPlane = true;
         UpdateSceneCapture();
-
-        float DistToPortal = FVector::Dist(
-            PlayerPawn->GetActorLocation(),
-            GetActorLocation());
-
-        if (DistToPortal < 500.0f)
-            SceneCapture->CaptureScene();
     }
 }
 
@@ -312,6 +360,74 @@ void APortalActor::UpdateSceneCapture()
     SceneCapture->ClipPlaneNormal = -LinkedPortal->GetActorForwardVector();
 }
 
+void APortalActor::CheckPortalCrossing(UCameraComponent* Camera)
+{
+    if (!Camera) return;
+
+    FVector CameraPos = Camera->GetComponentLocation();
+    FVector PortalPos = GetActorLocation();
+    FVector PortalNormal = GetActorForwardVector();
+
+    // 포탈까지 거리가 너무 멀면 체크 안 함
+    float DistToPortal = FVector::Dist(CameraPos, PortalPos);
+    if (DistToPortal > 200.0f)
+    {
+        LastDotSign = 0;
+        return;
+    }
+
+    // 포탈 평면 기준 카메라 부호 (양수=앞, 음수=뒤)
+    FVector ToCamera = CameraPos - PortalPos;
+    float Dot = FVector::DotProduct(ToCamera, PortalNormal);
+    int32 CurrentSign = (Dot >= 0.0f) ? 1 : -1;
+
+    // 앞(+)에서 뒤(-)로 넘어간 순간 = 포탈 통과
+    if (LastDotSign == 1 && CurrentSign == -1)
+    {
+        UE_LOG(LogTemp, Warning, TEXT("[Portal] Camera crossed portal plane → Teleporting"));
+        ExecuteTeleport(UGameplayStatics::GetPlayerPawn(GetWorld(), 0));
+    }
+
+    LastDotSign = CurrentSign;
+}
+
+void APortalActor::ExecuteTeleport(APawn* Pawn)
+{
+    if (!Pawn) return;
+
+    // 모드 1: TargetLevel
+    if (!TargetLevel.IsNull() && StreamingLevel && StreamingLevel->GetLoadedLevel())
+    {
+        FVector TeleportLocation = TargetCaptureLocation;
+        FRotator TeleportRotation = TargetViewTransform.GetRotation().Rotator();
+        Pawn->SetActorLocationAndRotation(TeleportLocation, TeleportRotation);
+        LastDotSign = 0;
+
+        UE_LOG(LogTemp, Warning, TEXT("[Portal] Teleported to TargetLevel at %s"),
+            *TeleportLocation.ToString());
+        return;
+    }
+
+    // 모드 2: LinkedPortal
+    if (!LinkedPortal) return;
+
+    FTransform ThisTransform = GetActorTransform();
+    FVector LocalPosition = ThisTransform.InverseTransformPosition(Pawn->GetActorLocation());
+    FQuat   LocalRotation = ThisTransform.InverseTransformRotation(Pawn->GetActorRotation().Quaternion());
+
+    FTransform LinkedTransform = LinkedPortal->GetActorTransform();
+    FVector NewPosition = LinkedTransform.TransformPosition(LocalPosition);
+    FQuat   NewRotation = LinkedTransform.TransformRotation(LocalRotation);
+
+    FRotator FinalRotation = NewRotation.Rotator();
+    FinalRotation.Yaw += 180.0f;
+
+    Pawn->SetActorLocationAndRotation(NewPosition, FinalRotation);
+    LastDotSign = 0;
+
+    UE_LOG(LogTemp, Warning, TEXT("[Portal] Teleported to LinkedPortal"));
+}
+
 void APortalActor::OnOverlapBegin(UPrimitiveComponent* OverlappedComp,
     AActor* OtherActor,
     UPrimitiveComponent* OtherComp,
@@ -319,13 +435,25 @@ void APortalActor::OnOverlapBegin(UPrimitiveComponent* OverlappedComp,
     bool bFromSweep,
     const FHitResult& SweepResult)
 {
+    UE_LOG(LogTemp, Warning, TEXT("[Teleport] OnOverlapBegin: OtherActor=%s"), *OtherActor->GetName());
+
     APawn* Pawn = Cast<APawn>(OtherActor);
-    if (!Pawn) return;
+    if (!Pawn)
+    {
+        UE_LOG(LogTemp, Warning, TEXT("[Teleport] FAIL: OtherActor is not a Pawn"));
+        return;
+    }
 
     // 포탈 앞면에서 진입했는지 확인 (뒤에서 진입 방지)
     FVector ToPlayer = Pawn->GetActorLocation() - GetActorLocation();
     float Dot = FVector::DotProduct(ToPlayer, GetActorForwardVector());
+    UE_LOG(LogTemp, Warning, TEXT("[Teleport] Dot product: %.2f (negative = back side, teleport blocked)"), Dot);
     if (Dot < 0.0f) return;
+
+    UE_LOG(LogTemp, Warning, TEXT("[Teleport] TargetLevel.IsNull=%d, StreamingLevel=%d, LoadedLevel=%d"),
+        (int32)TargetLevel.IsNull(),
+        (int32)(StreamingLevel != nullptr),
+        (int32)(StreamingLevel && StreamingLevel->GetLoadedLevel() != nullptr));
 
     // 모드 1: TargetLevel (스트리밍 레벨로 순간이동)
     if (!TargetLevel.IsNull() && StreamingLevel && StreamingLevel->GetLoadedLevel())

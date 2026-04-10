@@ -81,14 +81,21 @@ void FPortalViewExtension::PreRenderViewFamily_RenderThread(
     FRDGBuilder& GraphBuilder,
     FSceneViewFamily& InViewFamily)
 {
-    if (InViewFamily.Views.Num() > 0 && InViewFamily.Views[0]->bIsSceneCapture)
-        return;
-
-    FScopeLock Lock(&DataLock);
-
     extern RENDERER_API float GPortalFrustumMaxDistance;
     extern RENDERER_API FPlane GPortalFrustumPlanes[5];
     extern RENDERER_API int32 GPortalFrustumPlaneCount;
+
+    if (InViewFamily.Views.Num() > 0 && InViewFamily.Views[0]->bIsSceneCapture)
+    {
+        // SceneCapture 렌더링 중에는 프러스텀 컬링 반드시 비활성화
+        // 메인 카메라가 설정한 플레인이 SceneCapture 렌더링에도 영향을 주기 때문
+        // return만 하면 이전 프레임 플레인이 그대로 남아 타겟 레벨 오브젝트 전부 컬링됨
+        GPortalFrustumPlaneCount = 0;
+        GPortalFrustumMaxDistance = 0.0f;
+        return;
+    }
+
+    FScopeLock Lock(&DataLock);
 
     // 벤치마크 토글: r.Portal.FrustumCulling 0 이면 Culling 비활성화
     if (CVarPortalFrustumCulling.GetValueOnRenderThread() == 0)
