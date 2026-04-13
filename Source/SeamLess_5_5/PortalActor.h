@@ -54,6 +54,12 @@ public:
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Portal|Target")
     FVector TargetCaptureLocation;
 
+    // ===== 디버그 =====
+
+    /** true 시 SceneCapture 샘플 레이 + 포탈 프러스텀을 씬에 선으로 그림 */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Portal|Debug")
+    bool bDebugLumenRays = false;
+
     // ===== 스텐실 버퍼 포탈 마스킹 =====
 
     /** 스텐실 기반 포탈 마스킹용 Post Process 머티리얼 (에디터에서 할당) */
@@ -88,9 +94,13 @@ private:
     void BindStencilMaterialToVolume();
     void CheckPortalCrossing(UCameraComponent* Camera);
     void ExecuteTeleport(APawn* Pawn);
+    void DrawLumenDebug(UCameraComponent* Camera);
 
     // 포탈 평면 통과 감지용 — 이전 프레임 부호 저장
     int32 LastDotSign = 0;
+
+    // 디버그 레이가 이미 그려졌는지
+    bool bDebugLinesDrawn = false;
 
     UPROPERTY()
     UMaterialInstanceDynamic* DynamicMaterial;

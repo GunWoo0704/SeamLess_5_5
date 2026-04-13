@@ -211,6 +211,22 @@ void APortalActor::Tick(float DeltaTime)
 {
     Super::Tick(DeltaTime);
 
+    // 디버그 레이: 켜면 한 번 그리고 유지, 끄면 제거
+    if (bDebugLumenRays && !bDebugLinesDrawn)
+    {
+        APawn* DebugPawn = UGameplayStatics::GetPlayerPawn(GetWorld(), 0);
+        UCameraComponent* DebugCamera = DebugPawn
+            ? DebugPawn->FindComponentByClass<UCameraComponent>()
+            : nullptr;
+        DrawLumenDebug(DebugCamera);
+        bDebugLinesDrawn = true;
+    }
+    else if (!bDebugLumenRays && bDebugLinesDrawn)
+    {
+        FlushPersistentDebugLines(GetWorld());
+        bDebugLinesDrawn = false;
+    }
+
     if (!ViewExtension.IsValid()) return;
 
     // StreamingLevel 바운드 수집
@@ -248,10 +264,11 @@ void APortalActor::Tick(float DeltaTime)
     UpdatePortalFrustumData();
 
     APawn* PlayerPawn = UGameplayStatics::GetPlayerPawn(GetWorld(), 0);
-    if (!PlayerPawn) return;
+    UCameraComponent* Camera = PlayerPawn
+        ? PlayerPawn->FindComponentByClass<UCameraComponent>()
+        : nullptr;
 
-    UCameraComponent* Camera = PlayerPawn->FindComponentByClass<UCameraComponent>();
-    if (!Camera) return;
+    if (!PlayerPawn || !Camera) return;
 
     // VR에서는 Overlap이 안 잡히는 경우가 많아서 Tick에서 직접 감지
     CheckPortalCrossing(Camera);
@@ -426,6 +443,97 @@ void APortalActor::ExecuteTeleport(APawn* Pawn)
     LastDotSign = 0;
 
     UE_LOG(LogTemp, Warning, TEXT("[Portal] Teleported to LinkedPortal"));
+}
+
+void APortalActor::DrawLumenDebug(UCameraComponent* Camera)
+{
+    UWorld* World = GetWorld();
+    if (!World) return;
+
+    // ───────────────────────────────────────────────
+    // 1) SceneCapture 샘플 레이 그리드 (Red)
+    //    Lumen이 타겟 레벨을 어떤 방향으로 샘플링하는지 시각화
+    // ───────────────────────────────────────────────
+    FVector CapturePos     = SceneCapture->GetComponentLocation();
+    FVector CaptureForward = SceneCapture->GetForwardVector();
+    FVector CaptureRight   = SceneCapture->GetRightVector();
+    FVector CaptureUp      = SceneCapture->GetUpVector();
+
+    const int32 GridSize  = 20;    // 20x20 = 400개 레이
+    const float Spread    = 0.8f;  // FOV 104도에 맞춰 넓게
+    const float RayLength = 2000.f;
+
+    for (int32 xi = 0; xi < GridSize; xi++)
+    {
+        for (int32 yi = 0; yi < GridSize; yi++)
+        {
+            float OffsetX = (xi - (GridSize - 1) * 0.5f) * Spread / (GridSize - 1);
+            float OffsetY = (yi - (GridSize - 1) * 0.5f) * Spread / (GridSize - 1);
+
+            FVector Dir = (CaptureForward
+                         + CaptureRight * OffsetX
+                         + CaptureUp    * OffsetY).GetSafeNormal();
+
+            DrawDebugLine(
+                World,
+                CapturePos,
+                CapturePos + Dir * RayLength,
+                FColor::Red,
+                true,    // bPersistentLines = true → FlushPersistentDebugLines로 명시적 제거
+                -1.f,
+                0,
+                0.5f
+            );
+        }
+    }
+
+    // SceneCapture 위치 표시 (노란 구)
+    DrawDebugSphere(World, CapturePos, 8.f, 8, FColor::Yellow, true, -1.f, 0, 1.5f);
+
+    // ───────────────────────────────────────────────
+    // 2) 포탈 프러스텀 (Green) — 카메라 → 포탈 4꼭짓점
+    // ───────────────────────────────────────────────
+    FVector PortalCenter = PortalMesh->GetComponentLocation();
+    FVector Right = PortalMesh->GetRightVector();
+    FVector Up    = PortalMesh->GetUpVector();
+    FVector Scale = PortalMesh->GetComponentScale();
+    float HalfW = 50.f * Scale.Y;
+    float HalfH = 50.f * Scale.Z;
+
+    FVector Corners[4] = {
+        PortalCenter + Right * HalfW + Up * HalfH,
+        PortalCenter - Right * HalfW + Up * HalfH,
+        PortalCenter - Right * HalfW - Up * HalfH,
+        PortalCenter + Right * HalfW - Up * HalfH
+    };
+
+    for (int32 i = 0; i < 4; i++)
+        DrawDebugLine(World, Corners[i], Corners[(i + 1) % 4], FColor::Green, true, -1.f, 0, 2.f);
+
+    if (Camera)
+    {
+        FVector CameraPos = Camera->GetComponentLocation();
+        for (int32 i = 0; i < 4; i++)
+            DrawDebugLine(World, CameraPos, Corners[i], FColor(0, 200, 0), true, -1.f, 0, 0.5f);
+    }
+
+    // ───────────────────────────────────────────────
+    // 3) 포탈 법선 벡터 (Red 화살표)
+    // ───────────────────────────────────────────────
+    FVector PortalNormal = GetActorForwardVector();
+    DrawDebugDirectionalArrow(
+        World,
+        PortalCenter,
+        PortalCenter + PortalNormal * 120.f,
+        30.f,
+        FColor::Red,
+        true, -1.f, 0, 2.f
+    );
+
+    // ───────────────────────────────────────────────
+    // 4) 텔레포트 감지 거리 (Orange 구, 200cm)
+    // ───────────────────────────────────────────────
+    DrawDebugSphere(World, GetActorLocation(), 200.f, 16, FColor::Orange, true, -1.f, 0, 0.5f);
 }
 
 void APortalActor::OnOverlapBegin(UPrimitiveComponent* OverlappedComp,
