@@ -54,6 +54,12 @@ public:
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Portal|Target")
     FVector TargetCaptureLocation;
 
+    /** 스트리밍 레벨(Downtown_Alley)을 스폰한 뒤 추가로 회전시킬 값.
+     *  TargetViewTransform.Rotation 위에 덧붙여서 적용됨.
+     *  레벨 안 건물/소품 전체가 이 값만큼 돌아감 (SceneCapture/시야는 영향 X). */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Portal|Target")
+    FRotator TargetLevelRotation = FRotator::ZeroRotator;
+
     // ===== 디버그 =====
 
     /** true 시 SceneCapture 샘플 레이 + 포탈 프러스텀을 씬에 선으로 그림 */

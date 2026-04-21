@@ -10,6 +10,29 @@
 #include "Engine/PostProcessVolume.h"
 #include "EngineUtils.h"
 #include "DrawDebugHelpers.h"
+#include "HAL/IConsoleManager.h"
+
+// ───────────────────────────────────────────────────────────────
+// 벤치마크용 토글 — 콘솔에서 r.Portal.Enable 0/1 로 켜고 끄기
+//   0: 포탈 전체 비활성 (SceneCapture 중단 + 메시 숨김 + Frustum 갱신 중단)
+//      → Baseline 측정용
+//   1: 포탈 정상 동작 (기본값)
+//
+// FrustumCulling 토글은 PortalViewExtension.cpp 에 별도 존재:
+//   r.Portal.FrustumCulling 0/1
+//
+// 3가지 벤치마크 시나리오:
+//   ① r.Portal.Enable 0                           → Baseline
+//   ② r.Portal.Enable 1, r.Portal.FrustumCulling 0 → 최적화 미적용
+//   ③ r.Portal.Enable 1, r.Portal.FrustumCulling 1 → 최적화 적용 (저희 기여)
+// ───────────────────────────────────────────────────────────────
+static TAutoConsoleVariable<int32> CVarPortalEnable(
+    TEXT("r.Portal.Enable"),
+    1,
+    TEXT("0: Portal 전체 비활성화 (벤치마크 Baseline)\n")
+    TEXT("1: Portal 정상 동작 (기본값)"),
+    ECVF_Default
+);
 
 APortalActor::APortalActor()
 {
@@ -149,18 +172,27 @@ void APortalActor::BindStencilMaterialToVolume()
 
 void APortalActor::LoadTargetLevel()
 {
+    // TargetViewTransform.Rotation + TargetLevelRotation을 합성해
+    // 스트리밍 레벨 전체를 회전시킴.
+    // 예) TargetLevelRotation.Yaw = 90 → Downtown_Alley가 Z축 기준 90도 돌아서 스폰됨
+    const FQuat ComposedQ =
+        TargetLevelRotation.Quaternion() * TargetViewTransform.GetRotation();
+    const FRotator SpawnRot = ComposedQ.Rotator();
+
     bool bSuccess = false;
     StreamingLevel = ULevelStreamingDynamic::LoadLevelInstanceBySoftObjectPtr(
         GetWorld(),
         TargetLevel,
         TargetViewTransform.GetLocation(),
-        TargetViewTransform.GetRotation().Rotator(),
+        SpawnRot,
         bSuccess
     );
 
     if (StreamingLevel && bSuccess)
     {
         StreamingLevel->OnLevelLoaded.AddDynamic(this, &APortalActor::OnTargetLevelLoaded);
+        UE_LOG(LogTemp, Warning, TEXT("[Portal] TargetLevel spawn rot=%s (LevelRot=%s)"),
+            *SpawnRot.ToString(), *TargetLevelRotation.ToString());
     }
     else
     {
@@ -210,6 +242,35 @@ void APortalActor::UpdateStreamingLevelBounds()
 void APortalActor::Tick(float DeltaTime)
 {
     Super::Tick(DeltaTime);
+
+    // ── 벤치마크 토글 처리 ─────────────────────────────────────
+    // r.Portal.Enable 0 일 때 포탈 렌더/캡처/프러스텀 갱신 전부 중단
+    // 상태 변경 시에만 컴포넌트 가시성을 토글 (매 프레임 SetVisibility 방지)
+    const bool bPortalEnabled = (CVarPortalEnable.GetValueOnGameThread() != 0);
+    static bool bLastPortalEnabled = true;
+    if (bPortalEnabled != bLastPortalEnabled)
+    {
+        if (PortalMesh) PortalMesh->SetVisibility(bPortalEnabled, true);
+        if (SceneCapture)
+        {
+            SceneCapture->SetVisibility(bPortalEnabled, true);
+            if (!bPortalEnabled) SceneCapture->bCaptureEveryFrame = false;
+        }
+        bLastPortalEnabled = bPortalEnabled;
+
+        UE_LOG(LogTemp, Warning, TEXT("[Portal] r.Portal.Enable = %d"), bPortalEnabled ? 1 : 0);
+    }
+
+    if (!bPortalEnabled)
+    {
+        // 포탈 OFF 상태 — 디버그 라인만 정리하고 나머지 로직 전부 스킵
+        if (bDebugLinesDrawn)
+        {
+            FlushPersistentDebugLines(GetWorld());
+            bDebugLinesDrawn = false;
+        }
+        return;
+    }
 
     // 디버그 레이: 켜면 한 번 그리고 유지, 끄면 제거
     if (bDebugLumenRays && !bDebugLinesDrawn)
