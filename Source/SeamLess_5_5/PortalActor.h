@@ -78,6 +78,7 @@ public:
 
     virtual void Tick(float DeltaTime) override;
     virtual void BeginPlay() override;
+    virtual void EndPlay(const EEndPlayReason::Type EndPlayReason) override;
 
 protected:
     UFUNCTION()
@@ -101,6 +102,15 @@ private:
     void CheckPortalCrossing(UCameraComponent* Camera);
     void ExecuteTeleport(APawn* Pawn);
     void DrawLumenDebug(UCameraComponent* Camera);
+
+    // ===== Phase 1: SceneCapture2D 공식 최적화 =====
+    /** ShowFlags / LOD / MaxViewDistance / PostProcess 한꺼번에 토글 */
+    void ApplyPhase1ShowFlags(bool bEnable);
+    /** PrimitiveRenderMode + ShowOnlyActors 토글 (StreamingLevelActors가 채워진 후 호출) */
+    void ApplyPhase1ShowOnlyActors(bool bEnable);
+
+    // CVar 토글 감지용 — 이전 프레임 상태 저장 (-1: 초기화 전)
+    int32 LastPhase1State = -1;
 
     // 포탈 평면 통과 감지용 — 이전 프레임 부호 저장
     int32 LastDotSign = 0;

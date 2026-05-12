@@ -1,4 +1,6 @@
 #include "PortalActor.h"
+#include "PortalLevelManager.h"
+#include "PortalScheduler.h"
 #include "Kismet/GameplayStatics.h"
 #include "Camera/PlayerCameraManager.h"
 #include "Camera/CameraComponent.h"
@@ -31,6 +33,38 @@ static TAutoConsoleVariable<int32> CVarPortalEnable(
     1,
     TEXT("0: Portal 전체 비활성화 (벤치마크 Baseline)\n")
     TEXT("1: Portal 정상 동작 (기본값)"),
+    ECVF_Default
+);
+
+// ───────────────────────────────────────────────────────────────
+// Phase 1: SceneCapture2D 공식 최적화 토글
+//   0: Phase 1 OFF — vanilla SceneCapture2D 동작
+//   1: Phase 1 ON  — ShowOnlyActors / 비싼 ShowFlags OFF / LODDistanceFactor 상향 등
+//
+// Phase 1은 UE5가 SceneCapture2D에 기본 제공하는 공식 최적화만 사용 (엔진 수정 X).
+// 메인 씬(Showcase) 액터를 포탈 캡처에서 제외하고, 포탈 뷰에서 안 보이는 PP 효과를 끔.
+// ───────────────────────────────────────────────────────────────
+static TAutoConsoleVariable<int32> CVarPortalPhase1(
+    TEXT("r.Portal.Phase1"),
+    1,
+    TEXT("0: Phase 1 (SceneCapture2D 공식 최적화) OFF\n")
+    TEXT("1: Phase 1 ON (ShowOnlyActors + ShowFlags off + LOD 강제, 기본값)"),
+    ECVF_Default
+);
+
+// ───────────────────────────────────────────────────────────────
+// Phase 2: Frame Budget Allocator (라운드로빈 캡처)
+//   0: 모든 포탈이 매 프레임 캡처 (Phase 1까지의 동작)
+//   1: 등록된 포탈 중 1개만 프레임당 캡처 (캡처 비용 ≒ 1포탈 비용)
+//
+// 다른 포탈들은 이전 프레임의 RT를 그대로 사용. N포탈이면 각 포탈은
+// 1/N 확률로 갱신 → 시각적으로 약간 stale하지만 정적 씬에서는 거의 안 보임.
+// ───────────────────────────────────────────────────────────────
+static TAutoConsoleVariable<int32> CVarPortalPhase2(
+    TEXT("r.Portal.Phase2"),
+    1,
+    TEXT("0: Phase 2 Frame Budget OFF (모든 포탈 매 프레임 캡처)\n")
+    TEXT("1: Phase 2 ON (라운드로빈으로 프레임당 1개만 캡처, 기본값)"),
     ECVF_Default
 );
 
@@ -137,8 +171,30 @@ void APortalActor::BeginPlay()
 
     TriggerVolume->OnComponentBeginOverlap.AddDynamic(this, &APortalActor::OnOverlapBegin);
 
+    // Phase 1: ShowFlags / LOD / PostProcess 적용 (ShowOnlyActors는 레벨 로드 후 OnTargetLevelLoaded에서)
+    const bool bPhase1 = (CVarPortalPhase1.GetValueOnGameThread() != 0);
+    ApplyPhase1ShowFlags(bPhase1);
+    LastPhase1State = bPhase1 ? 1 : 0;
+
+    // Phase 2: 스케줄러에 자신을 등록
+    if (UPortalScheduler* Sched = GetWorld()->GetSubsystem<UPortalScheduler>())
+    {
+        Sched->RegisterPortal(this);
+    }
+
     if (!TargetLevel.IsNull())
         LoadTargetLevel();
+}
+
+void APortalActor::EndPlay(const EEndPlayReason::Type EndPlayReason)
+{
+    // Phase 2: 스케줄러에서 자신을 제거 (PIE 종료/액터 파괴 시)
+    if (UPortalScheduler* Sched = GetWorld()->GetSubsystem<UPortalScheduler>())
+    {
+        Sched->UnregisterPortal(this);
+    }
+
+    Super::EndPlay(EndPlayReason);
 }
 
 void APortalActor::BindStencilMaterialToVolume()
@@ -172,31 +228,47 @@ void APortalActor::BindStencilMaterialToVolume()
 
 void APortalActor::LoadTargetLevel()
 {
+    // PortalLevelManager 서브시스템 통해 공유 로드.
+    // 같은 TargetLevel을 가진 다른 PortalActor가 이미 로드했다면
+    // 그 인스턴스를 재사용 (메모리/렌더 비용 N배 절감).
+    UPortalLevelManager* Mgr = GetWorld()->GetSubsystem<UPortalLevelManager>();
+    if (!Mgr)
+    {
+        UE_LOG(LogTemp, Error, TEXT("[Portal] PortalLevelManager subsystem not found"));
+        return;
+    }
+
     // TargetViewTransform.Rotation + TargetLevelRotation을 합성해
     // 스트리밍 레벨 전체를 회전시킴.
     // 예) TargetLevelRotation.Yaw = 90 → Downtown_Alley가 Z축 기준 90도 돌아서 스폰됨
+    // 주의: 같은 레벨을 공유하므로 두 번째 이후 포탈의 위치/회전은 무시되고
+    //       첫 번째 포탈이 정한 값이 적용됨.
     const FQuat ComposedQ =
         TargetLevelRotation.Quaternion() * TargetViewTransform.GetRotation();
     const FRotator SpawnRot = ComposedQ.Rotator();
 
-    bool bSuccess = false;
-    StreamingLevel = ULevelStreamingDynamic::LoadLevelInstanceBySoftObjectPtr(
-        GetWorld(),
+    StreamingLevel = Mgr->GetOrLoadLevel(
         TargetLevel,
         TargetViewTransform.GetLocation(),
-        SpawnRot,
-        bSuccess
-    );
+        SpawnRot);
 
-    if (StreamingLevel && bSuccess)
+    if (!StreamingLevel)
     {
-        StreamingLevel->OnLevelLoaded.AddDynamic(this, &APortalActor::OnTargetLevelLoaded);
-        UE_LOG(LogTemp, Warning, TEXT("[Portal] TargetLevel spawn rot=%s (LevelRot=%s)"),
-            *SpawnRot.ToString(), *TargetLevelRotation.ToString());
+        UE_LOG(LogTemp, Warning, TEXT("PortalActor: TargetLevel load failed"));
+        return;
+    }
+
+    // 다른 포탈이 이미 로드를 끝낸 상태면 콜백을 즉시 한 번 실행,
+    // 아직 로드 중이면 델리게이트 바인딩해서 완료될 때 호출되도록.
+    if (StreamingLevel->GetLoadedLevel())
+    {
+        UE_LOG(LogTemp, Warning, TEXT("[Portal] TargetLevel already loaded — invoking callback immediately"));
+        OnTargetLevelLoaded();
     }
     else
     {
-        UE_LOG(LogTemp, Warning, TEXT("PortalActor: TargetLevel load failed"));
+        StreamingLevel->OnLevelLoaded.AddDynamic(this, &APortalActor::OnTargetLevelLoaded);
+        UE_LOG(LogTemp, Warning, TEXT("[Portal] Bound OnLevelLoaded delegate (SpawnRot=%s)"), *SpawnRot.ToString());
     }
 }
 
@@ -218,6 +290,10 @@ void APortalActor::OnTargetLevelLoaded()
     UE_LOG(LogTemp, Warning, TEXT("[Portal] TargetLevel loaded! Actors: %d | Level: %s"),
         StreamingLevelActors.Num(),
         *LoadedLevel->GetPathName());
+
+    // Phase 1: 이제 액터 리스트가 채워졌으니 ShowOnlyActors 적용 가능
+    const bool bPhase1 = (CVarPortalPhase1.GetValueOnGameThread() != 0);
+    ApplyPhase1ShowOnlyActors(bPhase1);
 }
 
 void APortalActor::UpdateStreamingLevelBounds()
@@ -270,6 +346,18 @@ void APortalActor::Tick(float DeltaTime)
             bDebugLinesDrawn = false;
         }
         return;
+    }
+
+    // ── Phase 1 런타임 토글 감지 ─────────────────────────────
+    // r.Portal.Phase1 콘솔 변경 시 실시간 반영 (벤치마크 A/B 비교용)
+    const int32 CurPhase1 = CVarPortalPhase1.GetValueOnGameThread();
+    if (CurPhase1 != LastPhase1State)
+    {
+        const bool bPhase1 = (CurPhase1 != 0);
+        ApplyPhase1ShowFlags(bPhase1);
+        ApplyPhase1ShowOnlyActors(bPhase1);
+        LastPhase1State = CurPhase1;
+        UE_LOG(LogTemp, Warning, TEXT("[Portal-Phase1] Toggle = %d"), CurPhase1);
     }
 
     // 디버그 레이: 켜면 한 번 그리고 유지, 끄면 제거
@@ -343,6 +431,21 @@ void APortalActor::Tick(float DeltaTime)
     // 1000cm 이내: 매 프레임 캡처 (Lumen 누적), 이외: 캡처 정지 (성능)
     const float CaptureRange = 1000.0f;
     bool bShouldCapture = (DistToPortal < CaptureRange);
+
+    // ── Phase 2: Frame Budget Allocator ───────────────────────────
+    // 스케줄러가 "내 차례 아님"이라고 하면 캡처 스킵 → 이전 RT 그대로 사용
+    if (bShouldCapture && CVarPortalPhase2.GetValueOnGameThread() != 0)
+    {
+        if (UPortalScheduler* Sched = GetWorld()->GetSubsystem<UPortalScheduler>())
+        {
+            const bool bMyTurn = Sched->ShouldCaptureThisFrame(this);
+            if (!bMyTurn)
+            {
+                bShouldCapture = false;  // 이번 프레임은 RT 재사용
+            }
+        }
+    }
+
     SceneCapture->bCaptureEveryFrame = bShouldCapture;
 
     if (!TargetLevel.IsNull() && StreamingLevel && StreamingLevel->GetLoadedLevel())
@@ -654,4 +757,87 @@ void APortalActor::OnOverlapBegin(UPrimitiveComponent* OverlappedComp,
     Pawn->SetActorLocationAndRotation(NewPosition, FinalRotation);
 
     UE_LOG(LogTemp, Log, TEXT("PortalActor: Teleported to LinkedPortal"));
+}
+
+// ───────────────────────────────────────────────────────────────
+// Phase 1 — SceneCapture2D 공식 최적화 헬퍼
+// ───────────────────────────────────────────────────────────────
+
+void APortalActor::ApplyPhase1ShowFlags(bool bEnable)
+{
+    if (!SceneCapture) return;
+
+    // ── 비싼 ShowFlags OFF (포탈 뷰에서는 시각적 차이 거의 없음) ──
+    // 안개·모션블러·블룸·SSR·TAA·렌즈플레어·필름그레인·비네트
+    // bEnable=true → 위 효과 OFF (false 인자), bEnable=false → 원상복귀 (true 인자)
+    SceneCapture->ShowFlags.SetVolumetricFog(!bEnable);
+    SceneCapture->ShowFlags.SetMotionBlur(!bEnable);
+    SceneCapture->ShowFlags.SetBloom(!bEnable);
+    SceneCapture->ShowFlags.SetScreenSpaceReflections(!bEnable);  // Lumen Reflections와 중복
+    SceneCapture->ShowFlags.SetTemporalAA(!bEnable);
+    SceneCapture->ShowFlags.SetLensFlares(!bEnable);
+    SceneCapture->ShowFlags.SetGrain(!bEnable);
+    SceneCapture->ShowFlags.SetVignette(!bEnable);
+
+    // ── LOD 및 시야거리 강제 ──
+    // 포탈 RT는 메인 뷰보다 픽셀당 디테일 차이 잘 안 보이므로 강제 LOD 다운
+    if (bEnable)
+    {
+        SceneCapture->LODDistanceFactor = 2.5f;        // 값이 클수록 더 낮은 LOD 메시 사용
+        SceneCapture->MaxViewDistanceOverride = 8000.0f; // 80m 넘는 액터는 컷
+    }
+    else
+    {
+        SceneCapture->LODDistanceFactor = 1.0f;
+        SceneCapture->MaxViewDistanceOverride = -1.0f; // 비활성
+    }
+
+    // ── PostProcess 강제 오버라이드 (포탈 뷰 전용 경량 PP) ──
+    SceneCapture->PostProcessSettings.bOverride_MotionBlurAmount = bEnable;
+    SceneCapture->PostProcessSettings.bOverride_BloomIntensity = bEnable;
+    SceneCapture->PostProcessSettings.bOverride_LensFlareIntensity = bEnable;
+    SceneCapture->PostProcessSettings.bOverride_VignetteIntensity = bEnable;
+    SceneCapture->PostProcessSettings.bOverride_SceneFringeIntensity = bEnable;
+    if (bEnable)
+    {
+        SceneCapture->PostProcessSettings.MotionBlurAmount = 0.f;
+        SceneCapture->PostProcessSettings.BloomIntensity = 0.f;
+        SceneCapture->PostProcessSettings.LensFlareIntensity = 0.f;
+        SceneCapture->PostProcessSettings.VignetteIntensity = 0.f;
+        SceneCapture->PostProcessSettings.SceneFringeIntensity = 0.f;
+    }
+
+    UE_LOG(LogTemp, Warning,
+        TEXT("[Portal-Phase1] ShowFlags=%s, LOD=%g, MaxView=%g"),
+        bEnable ? TEXT("OPT") : TEXT("VANILLA"),
+        SceneCapture->LODDistanceFactor,
+        SceneCapture->MaxViewDistanceOverride);
+}
+
+void APortalActor::ApplyPhase1ShowOnlyActors(bool bEnable)
+{
+    if (!SceneCapture) return;
+
+    if (bEnable && StreamingLevelActors.Num() > 0)
+    {
+        // ── ShowOnlyList 모드: StreamingLevelActors만 렌더 후보로 ──
+        // 메인 씬(Showcase) 액터 전부 컷 → Basepass / Shadow / Lumen 모두 감소
+        SceneCapture->PrimitiveRenderMode = ESceneCapturePrimitiveRenderMode::PRM_UseShowOnlyList;
+        SceneCapture->ShowOnlyActors.Reset();
+        SceneCapture->ShowOnlyActors.Reserve(StreamingLevelActors.Num());
+        for (AActor* Actor : StreamingLevelActors)
+        {
+            if (Actor) SceneCapture->ShowOnlyActors.Add(Actor);
+        }
+        UE_LOG(LogTemp, Warning,
+            TEXT("[Portal-Phase1] ShowOnlyActors ON: %d actors (Alley only)"),
+            SceneCapture->ShowOnlyActors.Num());
+    }
+    else
+    {
+        // 원상복귀: 모든 액터 렌더 후보
+        SceneCapture->PrimitiveRenderMode = ESceneCapturePrimitiveRenderMode::PRM_LegacySceneCapture;
+        SceneCapture->ShowOnlyActors.Reset();
+        UE_LOG(LogTemp, Warning, TEXT("[Portal-Phase1] ShowOnlyActors OFF (vanilla)"));
+    }
 }
