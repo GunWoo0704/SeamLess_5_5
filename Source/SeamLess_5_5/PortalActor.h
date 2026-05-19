@@ -54,6 +54,13 @@ public:
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Portal|Target")
     FVector TargetCaptureLocation;
 
+    /** 포탈 카메라(SceneCapture)의 회전 오프셋.
+     *  플레이어 머리 회전 위에 합성되어 적용됨.
+     *  ZeroRotator면 순수 플레이어 머리 회전만 사용(기본 동작).
+     *  예) Yaw=90 → 플레이어가 정면을 봐도 카메라는 오른쪽을 보는 상태에서 시작. */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Portal|Target")
+    FRotator TargetCaptureRotation = FRotator::ZeroRotator;
+
     /** 스트리밍 레벨(Downtown_Alley)을 스폰한 뒤 추가로 회전시킬 값.
      *  TargetViewTransform.Rotation 위에 덧붙여서 적용됨.
      *  레벨 안 건물/소품 전체가 이 값만큼 돌아감 (SceneCapture/시야는 영향 X). */

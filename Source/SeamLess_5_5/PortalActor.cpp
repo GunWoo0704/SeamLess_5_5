@@ -454,9 +454,22 @@ void APortalActor::Tick(float DeltaTime)
         SceneCapture->bEnableClipPlane = false;
 
         // TargetCaptureLocation = 레벨 안 카메라 위치 (에디터에서 직접 설정)
+        // TargetCaptureRotation = 카메라 회전 오프셋. 플레이어 머리 회전과 합성됨.
+        //   - ZeroRotator: 순수 플레이어 머리 회전만 사용 (기본 동작)
+        //   - 값 있음: TargetCaptureRotation * PlayerRot 순서로 quaternion 합성
         // TargetViewTransform = 레벨 스폰 위치 (BeginPlay에서만 사용)
         FRotator PlayerRot = Camera->GetComponentRotation();
-        SceneCapture->SetWorldLocationAndRotation(TargetCaptureLocation, PlayerRot);
+        FRotator FinalCaptureRot;
+        if (TargetCaptureRotation.IsNearlyZero())
+        {
+            FinalCaptureRot = PlayerRot;
+        }
+        else
+        {
+            const FQuat CombinedQ = TargetCaptureRotation.Quaternion() * PlayerRot.Quaternion();
+            FinalCaptureRot = CombinedQ.Rotator();
+        }
+        SceneCapture->SetWorldLocationAndRotation(TargetCaptureLocation, FinalCaptureRot);
 
         // 디버그: 매 60프레임마다 상태 출력
         static int32 DebugFrame = 0;
