@@ -1,11 +1,14 @@
 #include "PortalActor.h"
 #include "PortalLevelManager.h"
 #include "PortalScheduler.h"
+#include "PortalRTPool.h"
 #include "Kismet/GameplayStatics.h"
 #include "Camera/PlayerCameraManager.h"
 #include "Camera/CameraComponent.h"
 #include "GameFramework/Pawn.h"
-#include "IXRTrackingSystem.h"
+// IXRTrackingSystem.h: 사용처 없음(주석에만 'HMD' 단어 1번). HeadMountedDisplay 모듈
+// 의존성을 안 더해도 되도록 include만 제거. 추후 실제 XR API 필요 시 Build.cs에
+// "HeadMountedDisplay" 모듈을 추가하고 이 헤더를 되살릴 것.
 #include "Engine/Engine.h"
 #include "Engine/World.h"
 #include "Engine/LevelStreamingDynamic.h"
@@ -68,6 +71,23 @@ static TAutoConsoleVariable<int32> CVarPortalPhase2(
     ECVF_Default
 );
 
+// ───────────────────────────────────────────────────────────────
+// Phase 3: RT Memory Pool with LRU + Adaptive Resolution
+//   0: 각 포탈 자기 HotRT(1920×1080) 보유 — VRAM N에 비례
+//   1: K(=4)개 공유 풀 + 포탈별 ColdRT(저해상도) — VRAM 상수
+//
+// Hot 포탈: 풀 RT에 캡처, 머티리얼이 풀 RT 읽음
+// Cold 포탈: 캡처 안 함, 머티리얼이 자기 ColdRT 읽음
+// Hot→Cold 전환 시: 마지막으로 ColdRT 한 번 캡처해서 fallback 갱신
+// ───────────────────────────────────────────────────────────────
+static TAutoConsoleVariable<int32> CVarPortalPhase3(
+    TEXT("r.Portal.Phase3"),
+    1,
+    TEXT("0: Phase 3 RT Pool OFF (포탈마다 풀 RT, VRAM 폭증)\n")
+    TEXT("1: Phase 3 ON (K개 공유 풀, VRAM 상수, 기본값)"),
+    ECVF_Default
+);
+
 APortalActor::APortalActor()
 {
     PrimaryActorTick.bCanEverTick = true;
@@ -105,19 +125,34 @@ void APortalActor::BeginPlay()
 {
     Super::BeginPlay();
 
+    // 디테일 창 체크박스 상태를 CVar에 반영 (Play 시작 시 1회)
+    ApplyFeatureToggles();
+
     ViewExtension = FSceneViewExtensions::NewExtension<FPortalViewExtension>();
 
     // 포탈 메시: Custom Depth + Stencil 활성화
     PortalMesh->SetRenderCustomDepth(true);
     PortalMesh->SetCustomDepthStencilValue(PortalStencilValue);
 
-    // 렌더 타겟 생성
+    // 렌더 타겟 생성 (Phase 3 OFF일 때 또는 fallback용)
     if (!RenderTarget)
     {
         RenderTarget = NewObject<UTextureRenderTarget2D>(this);
         RenderTarget->InitAutoFormat(1920, 1080);
         RenderTarget->bAutoGenerateMips = false;
         RenderTarget->RenderTargetFormat = RTF_RGBA16f;
+    }
+
+    // Phase 3: ColdRT 생성 — 작은 해상도, 포탈별 영구 보유
+    if (!ColdRenderTarget)
+    {
+        ColdRenderTarget = NewObject<UTextureRenderTarget2D>(this);
+        ColdRenderTarget->InitAutoFormat(ColdRTWidth, ColdRTHeight);
+        ColdRenderTarget->bAutoGenerateMips = false;
+        ColdRenderTarget->RenderTargetFormat = RTF_RGBA16f;
+        UE_LOG(LogTemp, Warning, TEXT("[Portal-Phase3] ColdRT created %dx%d (%.2f KB)"),
+            ColdRTWidth, ColdRTHeight,
+            (ColdRTWidth * ColdRTHeight * 8.0f) / 1024.0f);
     }
 
     SceneCapture->TextureTarget = RenderTarget;
@@ -188,11 +223,34 @@ void APortalActor::BeginPlay()
 
 void APortalActor::EndPlay(const EEndPlayReason::Type EndPlayReason)
 {
-    // Phase 2: 스케줄러에서 자신을 제거 (PIE 종료/액터 파괴 시)
-    if (UPortalScheduler* Sched = GetWorld()->GetSubsystem<UPortalScheduler>())
+    // 월드가 유효할 때만 서브시스템 정리 (teardown 중 GetWorld() null 방어)
+    if (UWorld* World = GetWorld())
     {
-        Sched->UnregisterPortal(this);
+        // Phase 2: 스케줄러에서 자신을 제거 (PIE 종료/액터 파괴 시)
+        if (UPortalScheduler* Sched = World->GetSubsystem<UPortalScheduler>())
+        {
+            Sched->UnregisterPortal(this);
+        }
+
+        // Phase 3: RT Pool에서도 자신을 제거
+        if (UPortalRTPool* RTPool = World->GetSubsystem<UPortalRTPool>())
+        {
+            RTPool->UnregisterPortal(this);
+        }
+
+        // ── Phase 0 (refcount): 레벨 참조 해제 ──
+        // 이 포탈이 잡고 있던 TargetLevel의 refcount를 1 감소.
+        // 같은 레벨을 공유하던 마지막 포탈이면 즉시 unload되어 메모리 회수.
+        if (!TargetLevel.IsNull() && StreamingLevel)
+        {
+            if (UPortalLevelManager* Mgr = World->GetSubsystem<UPortalLevelManager>())
+            {
+                Mgr->ReleaseLevel(TargetLevel);
+            }
+        }
     }
+    StreamingLevel = nullptr;
+    StreamingLevelActors.Reset();
 
     Super::EndPlay(EndPlayReason);
 }
@@ -247,7 +305,8 @@ void APortalActor::LoadTargetLevel()
         TargetLevelRotation.Quaternion() * TargetViewTransform.GetRotation();
     const FRotator SpawnRot = ComposedQ.Rotator();
 
-    StreamingLevel = Mgr->GetOrLoadLevel(
+    // ── Phase 0 (refcount): AcquireLevel — 마지막 포탈이 사라질 때 자동 unload ──
+    StreamingLevel = Mgr->AcquireLevel(
         TargetLevel,
         TargetViewTransform.GetLocation(),
         SpawnRot);
@@ -283,7 +342,7 @@ void APortalActor::OnTargetLevelLoaded()
     StreamingLevelActors.Reset();
     for (AActor* Actor : LoadedLevel->Actors)
     {
-        if (!Actor) continue;
+        if (!IsValid(Actor)) continue;
         StreamingLevelActors.Add(Actor);
     }
 
@@ -303,7 +362,7 @@ void APortalActor::UpdateStreamingLevelBounds()
     TArray<FBoxSphereBounds> StreamingBounds;
     for (AActor* Actor : StreamingLevelActors)
     {
-        if (!Actor || !Actor->GetRootComponent()) continue;
+        if (!IsValid(Actor) || !Actor->GetRootComponent()) continue;
         FBox Box = Actor->GetComponentsBoundingBox(true);
         if (Box.IsValid && Box.GetExtent().SizeSquared() > 0.0f)
             StreamingBounds.Add(FBoxSphereBounds(Box));
@@ -318,6 +377,14 @@ void APortalActor::UpdateStreamingLevelBounds()
 void APortalActor::Tick(float DeltaTime)
 {
     Super::Tick(DeltaTime);
+
+    // ── 방어 코드 ──────────────────────────────────────────────
+    // 핵심 컴포넌트/월드가 유효하지 않으면 이번 틱은 통째로 스킵.
+    // (Live Coding 재인스턴싱, 액터 파괴 진행 중 등 비정상 상태에서의 크래시 방지)
+    if (!IsValid(SceneCapture) || !IsValid(PortalMesh) || !GetWorld())
+    {
+        return;
+    }
 
     // ── 벤치마크 토글 처리 ─────────────────────────────────────
     // r.Portal.Enable 0 일 때 포탈 렌더/캡처/프러스텀 갱신 전부 중단
@@ -387,7 +454,7 @@ void APortalActor::Tick(float DeltaTime)
         {
             for (AActor* Actor : LoadedLevel->Actors)
             {
-                if (!Actor) continue;
+                if (!IsValid(Actor)) continue;
                 StreamingLevelActors.Add(Actor);
             }
         }
@@ -397,7 +464,7 @@ void APortalActor::Tick(float DeltaTime)
             TArray<FBoxSphereBounds> StreamingBounds;
             for (AActor* Actor : StreamingLevelActors)
             {
-                if (!Actor || !Actor->GetRootComponent()) continue;
+                if (!IsValid(Actor) || !Actor->GetRootComponent()) continue;
                 FBox Box = Actor->GetComponentsBoundingBox(true);
                 if (Box.IsValid && Box.GetExtent().SizeSquared() > 0.0f)
                     StreamingBounds.Add(FBoxSphereBounds(Box));
@@ -446,6 +513,53 @@ void APortalActor::Tick(float DeltaTime)
         }
     }
 
+    // ── Phase 3: RT Memory Pool ──────────────────────────────────
+    // 우선순위 기반으로 K개 슬롯에 들어간 포탈만 풀 RT 받음.
+    // Cold 포탈은 자기 ColdRT를 머티리얼로 표시.
+    UTextureRenderTarget2D* TargetRT = RenderTarget;  // 기본값 (Phase 3 OFF)
+    bool bIsHot = true;
+    if (CVarPortalPhase3.GetValueOnGameThread() != 0)
+    {
+        if (UPortalRTPool* RTPool = GetWorld()->GetSubsystem<UPortalRTPool>())
+        {
+            const float Priority = ComputePortalPriority();
+            UTextureRenderTarget2D* HotRT = RTPool->RequestHotRT(this, Priority);
+
+            if (HotRT)
+            {
+                // Hot 슬롯 받음 → 풀 RT 사용
+                TargetRT = HotRT;
+                bIsHot = true;
+                LastHotRT = HotRT;
+            }
+            else
+            {
+                // Cold 슬롯 → 캡처 안 함, ColdRT 표시
+                bIsHot = false;
+                bShouldCapture = false;
+
+                // Hot→Cold 전환 감지 시 마지막 백업 캡처
+                if (LastHotRT && RTPool->WasHotLastFrame(this))
+                {
+                    DoFinalColdCapture();
+                    LastHotRT = nullptr;
+                }
+                TargetRT = ColdRenderTarget;
+            }
+        }
+    }
+
+    // SceneCapture 타겟 및 머티리얼 동적 갱신
+    if (SceneCapture->TextureTarget != TargetRT)
+    {
+        SceneCapture->TextureTarget = TargetRT;
+    }
+    if (DynamicMaterial)
+    {
+        DynamicMaterial->SetTextureParameterValue(FName("RenderTargetLeft"), TargetRT);
+        DynamicMaterial->SetTextureParameterValue(FName("RenderTargetRight"), TargetRT);
+    }
+
     SceneCapture->bCaptureEveryFrame = bShouldCapture;
 
     if (!TargetLevel.IsNull() && StreamingLevel && StreamingLevel->GetLoadedLevel())
@@ -471,15 +585,18 @@ void APortalActor::Tick(float DeltaTime)
         }
         SceneCapture->SetWorldLocationAndRotation(TargetCaptureLocation, FinalCaptureRot);
 
-        // 디버그: 매 60프레임마다 상태 출력
-        static int32 DebugFrame = 0;
-        if (++DebugFrame % 60 == 0)
+        // 디버그: 매 60프레임마다 상태 출력 (bDebugLumenRays 켰을 때만 — 평소 로그 도배 방지)
+        if (bDebugLumenRays)
         {
-            UE_LOG(LogTemp, Warning, TEXT("[Portal] SceneCapture pos: %s | LoadedLevel actors: %d"),
-                *TargetCaptureLocation.ToString(),
-                StreamingLevel->GetLoadedLevel()->Actors.Num());
-            UE_LOG(LogTemp, Warning, TEXT("[Portal] LevelSpawn(TargetViewTransform): %s"),
-                *TargetViewTransform.GetLocation().ToString());
+            static int32 DebugFrame = 0;
+            if (++DebugFrame % 60 == 0)
+            {
+                UE_LOG(LogTemp, Warning, TEXT("[Portal] SceneCapture pos: %s | LoadedLevel actors: %d"),
+                    *TargetCaptureLocation.ToString(),
+                    StreamingLevel->GetLoadedLevel()->Actors.Num());
+                UE_LOG(LogTemp, Warning, TEXT("[Portal] LevelSpawn(TargetViewTransform): %s"),
+                    *TargetViewTransform.GetLocation().ToString());
+            }
         }
     }
     else if (LinkedPortal)
@@ -493,6 +610,7 @@ void APortalActor::Tick(float DeltaTime)
 void APortalActor::UpdatePortalFrustumData()
 {
     if (!ViewExtension.IsValid()) return;
+    if (!IsValid(PortalMesh) || !GetWorld()) return;
 
     APawn* PlayerPawn = UGameplayStatics::GetPlayerPawn(GetWorld(), 0);
     if (!PlayerPawn) return;
@@ -625,7 +743,7 @@ void APortalActor::ExecuteTeleport(APawn* Pawn)
 void APortalActor::DrawLumenDebug(UCameraComponent* Camera)
 {
     UWorld* World = GetWorld();
-    if (!World) return;
+    if (!World || !IsValid(SceneCapture)) return;
 
     // ───────────────────────────────────────────────
     // 1) SceneCapture 샘플 레이 그리드 (Red)
@@ -720,6 +838,7 @@ void APortalActor::OnOverlapBegin(UPrimitiveComponent* OverlappedComp,
     bool bFromSweep,
     const FHitResult& SweepResult)
 {
+    if (!OtherActor) return;
     UE_LOG(LogTemp, Warning, TEXT("[Teleport] OnOverlapBegin: OtherActor=%s"), *OtherActor->GetName());
 
     APawn* Pawn = Cast<APawn>(OtherActor);
@@ -840,7 +959,7 @@ void APortalActor::ApplyPhase1ShowOnlyActors(bool bEnable)
         SceneCapture->ShowOnlyActors.Reserve(StreamingLevelActors.Num());
         for (AActor* Actor : StreamingLevelActors)
         {
-            if (Actor) SceneCapture->ShowOnlyActors.Add(Actor);
+            if (IsValid(Actor)) SceneCapture->ShowOnlyActors.Add(Actor);
         }
         UE_LOG(LogTemp, Warning,
             TEXT("[Portal-Phase1] ShowOnlyActors ON: %d actors (Alley only)"),
@@ -854,3 +973,116 @@ void APortalActor::ApplyPhase1ShowOnlyActors(bool bEnable)
         UE_LOG(LogTemp, Warning, TEXT("[Portal-Phase1] ShowOnlyActors OFF (vanilla)"));
     }
 }
+
+// ───────────────────────────────────────────────────────────────
+// Phase 3 — RT Memory Pool 헬퍼
+// ───────────────────────────────────────────────────────────────
+
+float APortalActor::GetCapturePriority() const
+{
+    return ComputePortalPriority();
+}
+
+float APortalActor::ComputePortalPriority() const
+{
+    // 우선순위 점수 = 거리 × 화면면적 × 시선 (가까울수록·클수록·정면일수록 높음)
+    APawn* PlayerPawn = UGameplayStatics::GetPlayerPawn(GetWorld(), 0);
+    if (!PlayerPawn) return 0.f;
+
+    const FVector PlayerLoc = PlayerPawn->GetActorLocation();
+    const FVector PortalLoc = GetActorLocation();
+    const float Dist = FVector::Dist(PlayerLoc, PortalLoc);
+
+    // 거리 기반 (가까울수록 높음): 1000cm 기준 정규화
+    const float DistScore = 1000.0f / FMath::Max(Dist, 1.0f);
+
+    // 화면 크기 기반 (포탈 메시 스케일): Y * Z 면적
+    const FVector Scale = PortalMesh ? PortalMesh->GetComponentScale() : FVector::OneVector;
+    const float AreaScore = Scale.Y * Scale.Z;
+
+    // 시선 기반: 카메라가 포탈을 향할수록 높고, 등 뒤(시야 밖)면 거의 0.
+    //   Facing = 1(정면) / 0(옆) / -1(등 뒤)  →  [0.05, 1.2] 로 매핑
+    float GazeScore = 1.0f;
+    if (const UCameraComponent* Cam = PlayerPawn->FindComponentByClass<UCameraComponent>())
+    {
+        const FVector ToPortal = (PortalLoc - Cam->GetComponentLocation()).GetSafeNormal();
+        const float Facing = static_cast<float>(FVector::DotProduct(Cam->GetForwardVector(), ToPortal));
+        // Facing[-1,1] → t[0,1] → GazeScore[0.05, 1.2] 선형 매핑
+        const float t = FMath::Clamp((Facing + 1.0f) * 0.5f, 0.0f, 1.0f);
+        GazeScore = 0.05f + t * (1.2f - 0.05f);
+    }
+
+    return DistScore * AreaScore * GazeScore;
+}
+
+void APortalActor::DoFinalColdCapture()
+{
+    if (!SceneCapture || !ColdRenderTarget) return;
+
+    // 마지막 1회 ColdRT 캡처 — Hot에서 Cold로 전환되기 전 fallback 갱신
+    UTextureRenderTarget2D* PrevTarget = SceneCapture->TextureTarget;
+    SceneCapture->TextureTarget = ColdRenderTarget;
+    SceneCapture->CaptureScene();
+    SceneCapture->TextureTarget = PrevTarget;
+
+    UE_LOG(LogTemp, Verbose, TEXT("[Portal-Phase3] Final ColdRT capture for fallback"));
+}
+
+// ───────────────────────────────────────────────────────────────
+// 디테일 창 기능 토글 (체크박스) 구현
+//   디테일 패널의 bool 체크박스를 켜고/끄면 대응 r.Portal.* CVar가 적용된다.
+// ───────────────────────────────────────────────────────────────
+void APortalActor::ApplyCVar(const TCHAR* CVarName, bool bOn, const FString& DisplayLabel)
+{
+    IConsoleVariable* CVar = IConsoleManager::Get().FindConsoleVariable(CVarName);
+    if (!CVar)
+    {
+        UE_LOG(LogTemp, Warning, TEXT("[Portal-Toggle] CVar '%s' 를 찾을 수 없습니다."), CVarName);
+        return;
+    }
+
+    CVar->Set(bOn ? TEXT("1") : TEXT("0"), ECVF_SetByConsole);
+
+    const FString StateText = bOn ? TEXT("ON") : TEXT("OFF");
+    UE_LOG(LogTemp, Display, TEXT("[Portal-Toggle] %s → %s (%s)"),
+        *DisplayLabel, *StateText, CVarName);
+
+    if (GEngine)
+    {
+        // CVarName 해시로 고정 키를 만들어, 같은 항목은 화면에서 갱신되도록 함
+        const uint64 Key = (uint64)GetTypeHash(FString(CVarName));
+        const FColor Color = bOn ? FColor::Green : FColor::Red;
+        GEngine->AddOnScreenDebugMessage(
+            Key, 4.0f, Color,
+            FString::Printf(TEXT("%s : %s"), *DisplayLabel, *StateText));
+    }
+}
+
+void APortalActor::ApplyFeatureToggles()
+{
+    ApplyCVar(TEXT("r.Portal.Enable"),        bEnablePortal,         TEXT("포탈 전체"));
+    ApplyCVar(TEXT("r.Portal.Phase1"),        bEnablePhase1,         TEXT("Phase 1 (SceneCapture 최적화)"));
+    ApplyCVar(TEXT("r.Portal.Phase2"),        bEnablePhase2,         TEXT("Phase 2 (Frame Budget)"));
+    ApplyCVar(TEXT("r.Portal.Phase3"),        bEnablePhase3,         TEXT("Phase 3 (RT Memory Pool)"));
+    ApplyCVar(TEXT("r.Portal.FrustumCulling"), bEnableFrustumCulling, TEXT("Frustum Culling"));
+}
+
+#if WITH_EDITOR
+void APortalActor::PostEditChangeProperty(FPropertyChangedEvent& PropertyChangedEvent)
+{
+    Super::PostEditChangeProperty(PropertyChangedEvent);
+
+    const FName Name = PropertyChangedEvent.GetPropertyName();
+
+    if (Name == GET_MEMBER_NAME_CHECKED(APortalActor, bEnablePortal))
+        ApplyCVar(TEXT("r.Portal.Enable"), bEnablePortal, TEXT("포탈 전체"));
+    else if (Name == GET_MEMBER_NAME_CHECKED(APortalActor, bEnablePhase1))
+        ApplyCVar(TEXT("r.Portal.Phase1"), bEnablePhase1, TEXT("Phase 1 (SceneCapture 최적화)"));
+    else if (Name == GET_MEMBER_NAME_CHECKED(APortalActor, bEnablePhase2))
+        ApplyCVar(TEXT("r.Portal.Phase2"), bEnablePhase2, TEXT("Phase 2 (Frame Budget)"));
+    else if (Name == GET_MEMBER_NAME_CHECKED(APortalActor, bEnablePhase3))
+        ApplyCVar(TEXT("r.Portal.Phase3"), bEnablePhase3, TEXT("Phase 3 (RT Memory Pool)"));
+    else if (Name == GET_MEMBER_NAME_CHECKED(APortalActor, bEnableFrustumCulling))
+        ApplyCVar(TEXT("r.Portal.FrustumCulling"), bEnableFrustumCulling, TEXT("Frustum Culling"));
+}
+#endif

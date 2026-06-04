@@ -17,9 +17,22 @@ void ARotatingLightActor::Tick(float DeltaTime)
 {
     Super::Tick(DeltaTime);
 
-    // 20ÃÊ¿¡ 360µµ ¡æ ÃÊ´ç È¸Àü °¢µµ °è»ê
+    // RotationDurationì´ 0(ë˜ëŠ” ìŒìˆ˜/ë¹„ì •ìƒ)ì´ë©´ 360/0 = inf â†’ NaN íšŒì „ â†’ í¬ë˜ì‹œ.
+    // ì•ˆì „í•˜ê²Œ ë°©ì–´: ìœ íš¨í•˜ì§€ ì•Šìœ¼ë©´ ì´ë²ˆ í‹±ì€ ê±´ë„ˆë›´ë‹¤.
+    if (!FMath::IsFinite(RotationDuration) || RotationDuration <= KINDA_SMALL_NUMBER)
+    {
+        return;
+    }
+
+    // RotationDurationì´ˆì— 360ë„ ë„ëŠ” ì´ˆë‹¹ íšŒì „ ê°ë„ ê³„ì‚°
     float DegreesPerSecond = 360.0f / RotationDuration;
     float DeltaAngle = DegreesPerSecond * DeltaTime;
+
+    // DeltaTime ìŠ¤íŒŒì´í¬ ë“±ìœ¼ë¡œ ë¹„ì •ìƒ ê°’ì´ ë‚˜ì˜¤ë©´ íšŒì „í•˜ì§€ ì•ŠìŒ
+    if (!FMath::IsFinite(DeltaAngle))
+    {
+        return;
+    }
 
     TArray<AActor*> DirectionalLights;
     UGameplayStatics::GetAllActorsOfClass(
@@ -29,7 +42,7 @@ void ARotatingLightActor::Tick(float DeltaTime)
 
     for (AActor* Light : DirectionalLights)
     {
-        // Àı´ë°ª ¼¼ÆÃ ´ë½Å ¸Å ÇÁ·¹ÀÓ Á¶±İ¾¿ ÁõºĞ È¸Àü
+        // ï¿½ï¿½ï¿½ë°ª ï¿½ï¿½ï¿½ï¿½ ï¿½ï¿½ï¿½ ï¿½ï¿½ ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ ï¿½ï¿½ï¿½İ¾ï¿½ ï¿½ï¿½ï¿½ï¿½ È¸ï¿½ï¿½
         Light->AddActorLocalRotation(FRotator(-DeltaAngle, 0.0f, 0.0f));
     }
 }

@@ -129,15 +129,12 @@ void FPortalViewExtension::PreRenderViewFamily_RenderThread(
             GPortalFrustumMaxDistance = 1500.0f;
         }
 
-        UE_LOG(LogTemp, Log, TEXT("PortalFrustum ACTIVE - Planes: %d, MaxDist: %f"),
-            GPortalFrustumPlaneCount, GPortalFrustumMaxDistance);
+        // (디버그 로그 제거: 매 렌더 프레임 호출돼 로그가 도배되고 렌더 스레드 부담)
     }
     else
     {
         GPortalFrustumMaxDistance = 0.0f;
         GPortalFrustumPlaneCount = 0;
-
-        UE_LOG(LogTemp, Log, TEXT("Portal INACTIVE"));
     }
 }
 
