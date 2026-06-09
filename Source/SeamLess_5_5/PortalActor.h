@@ -111,9 +111,10 @@ public:
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Portal|기능 토글")
     bool bEnablePhase2 = true;
 
-    /** Phase 3: RT Memory Pool (r.Portal.Phase3) */
+    /** Phase 3: RT Memory Pool (r.Portal.Phase3) — 기본 OFF.
+     *  포탈마다 다른 레벨을 보면 공유 풀이 화면을 뒤섞으므로, 단일 레벨 공유 벤치마크에서만 켤 것. */
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Portal|기능 토글")
-    bool bEnablePhase3 = true;
+    bool bEnablePhase3 = false;
 
     /** Frustum Culling (r.Portal.FrustumCulling) */
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Portal|기능 토글")
@@ -155,7 +156,19 @@ private:
     void UpdatePortalFrustumData();
     void CacheSceneActorBounds();
     void LoadTargetLevel();
+    /** 거리 기반으로 TargetLevel을 동적 로드/언로드 (히스테리시스).
+     *  가까우면 Acquire, 멀어지면 Release → 상주 레벨 수를 근처 몇 개로 제한. */
+    void UpdateLevelResidency();
+    /** TargetLevel 참조 해제(언로드). RenderTarget은 그대로 둬 마지막 캡처 유지. */
+    void ReleaseTargetLevel();
+    /** 레벨을 렌더+Tick 활성/비활성 토글 (상태 변화 시에만).
+     *  비활성: 레벨 숨김(SetShouldBeVisible false) + 액터 Tick off → CPU·GPU 절감.
+     *  포탈은 마지막 캡처(RenderTarget)를 계속 표시. */
+    void SetLevelActive(bool bActive);
     void UpdateStreamingLevelBounds();
+    /** 월드에 디렉셔널 라이트를 1개만 남기고 나머지(스트리밍 레벨 중복분 등)는 끈다.
+     *  Lights 비용 절감 + 모든 뷰가 같은 태양을 공유하도록. 레벨 로드 후 호출. */
+    void EnsureSingleDirectionalLight();
     void BindStencilMaterialToVolume();
     void CheckPortalCrossing(UCameraComponent* Camera);
     void ExecuteTeleport(APawn* Pawn);
@@ -194,6 +207,12 @@ private:
 
     UPROPERTY()
     ULevelStreamingDynamic* StreamingLevel = nullptr;
+
+    /** 이 포탈이 현재 TargetLevel 참조를 잡고 있는지 (중복 Acquire/Release 방지) */
+    bool bLevelAcquired = false;
+
+    /** 레벨이 현재 렌더+Tick 활성 상태인지 (SetLevelActive 토글 추적) */
+    bool bLevelActive = true;
 
     /** 스트리밍 레벨 액터 캐시.
      *  반드시 UPROPERTY(GC 추적)여야 함 — raw 포인터로 두면 레벨 언로드/액터 파괴 시

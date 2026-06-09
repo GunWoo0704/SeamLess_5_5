@@ -13,6 +13,8 @@
 #include "Engine/World.h"
 #include "Engine/LevelStreamingDynamic.h"
 #include "Engine/PostProcessVolume.h"
+#include "Engine/DirectionalLight.h"
+#include "Components/LightComponent.h"
 #include "EngineUtils.h"
 #include "DrawDebugHelpers.h"
 #include "HAL/IConsoleManager.h"
@@ -82,9 +84,10 @@ static TAutoConsoleVariable<int32> CVarPortalPhase2(
 // ───────────────────────────────────────────────────────────────
 static TAutoConsoleVariable<int32> CVarPortalPhase3(
     TEXT("r.Portal.Phase3"),
-    1,
-    TEXT("0: Phase 3 RT Pool OFF (포탈마다 풀 RT, VRAM 폭증)\n")
-    TEXT("1: Phase 3 ON (K개 공유 풀, VRAM 상수, 기본값)"),
+    0,  // 기본 OFF: 포탈마다 다른 레벨을 보는 경우 공유 풀이 화면을 뒤섞으므로.
+        // 여러 포탈이 "같은 레벨 하나"를 공유하는 벤치마크에서만 켤 것.
+    TEXT("0: Phase 3 RT Pool OFF (포탈마다 자기 RT, 기본값)\n")
+    TEXT("1: Phase 3 ON (K개 공유 풀 — 단일 레벨 공유 시에만 권장)"),
     ECVF_Default
 );
 
@@ -217,8 +220,9 @@ void APortalActor::BeginPlay()
         Sched->RegisterPortal(this);
     }
 
-    if (!TargetLevel.IsNull())
-        LoadTargetLevel();
+    // 레벨은 BeginPlay에서 전부 로드하지 않는다.
+    // 거리 기반으로 Tick의 UpdateLevelResidency()가 가까운 포탈만 동적 로드.
+    // (포탈마다 다른 레벨일 때 N개를 동시에 띄우면 프레임이 무너지므로)
 }
 
 void APortalActor::EndPlay(const EEndPlayReason::Type EndPlayReason)
@@ -317,6 +321,8 @@ void APortalActor::LoadTargetLevel()
         return;
     }
 
+    bLevelAcquired = true;  // 참조 보유 표시 (중복 Acquire/Release 방지)
+
     // 다른 포탈이 이미 로드를 끝낸 상태면 콜백을 즉시 한 번 실행,
     // 아직 로드 중이면 델리게이트 바인딩해서 완료될 때 호출되도록.
     if (StreamingLevel->GetLoadedLevel())
@@ -326,9 +332,107 @@ void APortalActor::LoadTargetLevel()
     }
     else
     {
-        StreamingLevel->OnLevelLoaded.AddDynamic(this, &APortalActor::OnTargetLevelLoaded);
+        StreamingLevel->OnLevelLoaded.AddUniqueDynamic(this, &APortalActor::OnTargetLevelLoaded);
         UE_LOG(LogTemp, Warning, TEXT("[Portal] Bound OnLevelLoaded delegate (SpawnRot=%s)"), *SpawnRot.ToString());
     }
+}
+
+// ───────────────────────────────────────────────────────────────
+// 거리 기반 동적 레벨 상주 (히스테리시스)
+//   포탈마다 다른 레벨일 때 N개를 동시에 띄우면 프레임 붕괴 → 가까운 것만 로드.
+//   LoadDist 이내로 들어오면 Acquire, UnloadDist 밖으로 나가면 Release.
+//   (UnloadDist > LoadDist 로 히스테리시스 → 경계에서 로드/언로드 깜빡임 방지)
+// ───────────────────────────────────────────────────────────────
+static TAutoConsoleVariable<float> CVarPortalLevelLoadDist(
+    TEXT("r.Portal.LevelLoadDist"),
+    1500.0f,
+    TEXT("이 거리(cm) 이내로 들어오면 포탈 레벨을 로드 (기본 1500=15m)"),
+    ECVF_Default
+);
+static TAutoConsoleVariable<float> CVarPortalLevelUnloadDist(
+    TEXT("r.Portal.LevelUnloadDist"),
+    2500.0f,
+    TEXT("이 거리(cm) 밖으로 나가면 포탈 레벨을 언로드 (기본 2500=25m). LoadDist보다 커야 함"),
+    ECVF_Default
+);
+
+void APortalActor::UpdateLevelResidency()
+{
+    // 링크드 포탈 모드(TargetLevel 없음)는 레벨 스트리밍 안 함
+    if (TargetLevel.IsNull()) return;
+
+    UWorld* World = GetWorld();
+    if (!World) return;
+
+    APawn* Pawn = UGameplayStatics::GetPlayerPawn(World, 0);
+    if (!Pawn) return;
+
+    const float Dist = FVector::Dist(Pawn->GetActorLocation(), GetActorLocation());
+    const float LoadDist = CVarPortalLevelLoadDist.GetValueOnGameThread();
+    float UnloadDist = CVarPortalLevelUnloadDist.GetValueOnGameThread();
+    // 안전: 언로드 거리는 항상 로드 거리보다 크게(히스테리시스 보장)
+    UnloadDist = FMath::Max(UnloadDist, LoadDist + 100.0f);
+
+    if (!bLevelAcquired && Dist <= LoadDist)
+    {
+        // 가까워짐 → 로드
+        LoadTargetLevel();
+    }
+    else if (bLevelAcquired && Dist > UnloadDist)
+    {
+        // 멀어짐 → 언로드 (RenderTarget은 그대로 둬 마지막 캡처 유지)
+        ReleaseTargetLevel();
+    }
+}
+
+void APortalActor::ReleaseTargetLevel()
+{
+    if (!bLevelAcquired) return;
+
+    if (UWorld* World = GetWorld())
+    {
+        if (UPortalLevelManager* Mgr = World->GetSubsystem<UPortalLevelManager>())
+        {
+            if (!TargetLevel.IsNull()) Mgr->ReleaseLevel(TargetLevel);
+        }
+    }
+
+    // 콜백 바인딩 해제 + 캐시 정리 (StreamingLevelActors는 더 이상 유효하지 않음)
+    if (StreamingLevel)
+    {
+        StreamingLevel->OnLevelLoaded.RemoveDynamic(this, &APortalActor::OnTargetLevelLoaded);
+    }
+    StreamingLevel = nullptr;
+    StreamingLevelActors.Reset();
+    bLevelAcquired = false;
+    bLevelActive = true;  // 다음에 다시 로드되면 기본 visible 상태와 일치시킴
+
+    // RenderTarget/ColdRenderTarget은 일부러 비우지 않음 → 마지막 캡처가 그대로 보임
+
+    UE_LOG(LogTemp, Warning, TEXT("[Portal] 레벨 언로드 (거리 멀어짐): %s"), *GetName());
+}
+
+void APortalActor::SetLevelActive(bool bActive)
+{
+    if (bActive == bLevelActive) return;   // 상태 변화 시에만 토글 (thrash/깜빡임 방지)
+    bLevelActive = bActive;
+
+    // 레벨 전체 가시성: 렌더/그림자/Lumen/DistanceField 씬에 포함·제외.
+    // 토글이 드물게(시선 이동 시에만) 일어나므로 비동기 가시화여도 무방.
+    if (StreamingLevel)
+    {
+        StreamingLevel->SetShouldBeVisible(bActive);
+    }
+
+    // 액터 Tick on/off — 비활성 레벨의 게임 스레드 비용 제거.
+    // (틱 불가 액터는 영향 없음, 틱 가능 액터만 토글됨)
+    for (AActor* Actor : StreamingLevelActors)
+    {
+        if (!IsValid(Actor)) continue;
+        Actor->SetActorTickEnabled(bActive);
+    }
+
+    UE_LOG(LogTemp, Verbose, TEXT("[Portal] SetLevelActive(%d): %s"), bActive ? 1 : 0, *GetName());
 }
 
 void APortalActor::OnTargetLevelLoaded()
@@ -353,6 +457,72 @@ void APortalActor::OnTargetLevelLoaded()
     // Phase 1: 이제 액터 리스트가 채워졌으니 ShowOnlyActors 적용 가능
     const bool bPhase1 = (CVarPortalPhase1.GetValueOnGameThread() != 0);
     ApplyPhase1ShowOnlyActors(bPhase1);
+
+    // 스트리밍 레벨이 자체 디렉셔널 라이트를 들고 들어오므로, 월드에 1개만 남기고 정리
+    EnsureSingleDirectionalLight();
+}
+
+// 월드에 디렉셔널 라이트를 1개만 남기는 최적화 토글.
+//   기본 0(OFF): 각 포탈이 서로 다른 레벨을 띄울 때 레벨별 태양을 끄면 어두워지므로 끔.
+//   1(ON): 모든 포탈이 "같은 레벨 하나"를 공유하는 벤치마크에서만 켜서 Lights 비용 절감.
+static TAutoConsoleVariable<int32> CVarPortalSingleDirLight(
+    TEXT("r.Portal.SingleDirLight"),
+    0,
+    TEXT("0: 끔(기본) — 레벨별 디렉셔널 라이트 유지\n")
+    TEXT("1: 켬 — 월드에 디렉셔널 라이트 1개만 남기고 나머지 끔 (단일 레벨 공유 시)"),
+    ECVF_Default
+);
+
+void APortalActor::EnsureSingleDirectionalLight()
+{
+    // 기본 OFF. 서로 다른 레벨을 쓰는 경우 켜면 레벨 조명이 사라지므로 opt-in.
+    if (CVarPortalSingleDirLight.GetValueOnGameThread() == 0) return;
+
+    UWorld* World = GetWorld();
+    if (!World) return;
+
+    TArray<AActor*> Lights;
+    UGameplayStatics::GetAllActorsOfClass(World, ADirectionalLight::StaticClass(), Lights);
+    if (Lights.Num() <= 1) return;  // 이미 1개 이하면 할 일 없음
+
+    ULevel* StreamedLevel = StreamingLevel ? StreamingLevel->GetLoadedLevel() : nullptr;
+
+    // 남길 라이트(Keep) 선정: 스트리밍 레벨이 아닌(=메인) 라이트를 우선.
+    ADirectionalLight* Keep = nullptr;
+    for (AActor* A : Lights)
+    {
+        ADirectionalLight* DL = Cast<ADirectionalLight>(A);
+        if (!IsValid(DL)) continue;
+        if (DL->GetLevel() != StreamedLevel) { Keep = DL; break; }
+    }
+    // 메인에 없으면 첫 번째 유효 라이트를 남김
+    if (!Keep)
+    {
+        for (AActor* A : Lights)
+        {
+            if (ADirectionalLight* DL = Cast<ADirectionalLight>(A))
+            {
+                if (IsValid(DL)) { Keep = DL; break; }
+            }
+        }
+    }
+
+    // Keep을 제외한 나머지 디렉셔널 라이트는 끈다 (라이트 컴포넌트 비가시화 → 라이팅 기여 제거)
+    int32 Disabled = 0;
+    for (AActor* A : Lights)
+    {
+        ADirectionalLight* DL = Cast<ADirectionalLight>(A);
+        if (!IsValid(DL) || DL == Keep) continue;
+        if (ULightComponent* LC = DL->GetLightComponent())
+        {
+            LC->SetVisibility(false);
+            Disabled++;
+        }
+    }
+
+    UE_LOG(LogTemp, Warning,
+        TEXT("[Portal] EnsureSingleDirectionalLight: 1개 유지, %d개 끔 (total=%d)"),
+        Disabled, Lights.Num());
 }
 
 void APortalActor::UpdateStreamingLevelBounds()
@@ -413,6 +583,18 @@ void APortalActor::Tick(float DeltaTime)
             bDebugLinesDrawn = false;
         }
         return;
+    }
+
+    // ── 거리 기반 동적 레벨 로드/언로드 ──────────────────────
+    // 가까운 포탈의 레벨만 상주시켜, 포탈 N개여도 동시 로드 레벨 수를 제한.
+    UpdateLevelResidency();
+
+    // ── 활성 레벨 게이팅 ─────────────────────────────────────
+    // 모여 있는 다른-레벨 다중 포탈: 우선순위 상위 N개 레벨만 렌더+Tick,
+    // 나머지는 숨기고 Tick 꺼서 CPU·GPU 동시 절감. (포탈은 마지막 캡처 유지)
+    if (UPortalScheduler* Sched = GetWorld()->GetSubsystem<UPortalScheduler>())
+    {
+        SetLevelActive(Sched->ShouldLevelBeActive(this));
     }
 
     // ── Phase 1 런타임 토글 감지 ─────────────────────────────
@@ -499,6 +681,20 @@ void APortalActor::Tick(float DeltaTime)
     const float CaptureRange = 1000.0f;
     bool bShouldCapture = (DistToPortal < CaptureRange);
 
+    // 레벨 스트리밍 모드인데 아직 로드 안 끝났으면 캡처 금지.
+    // (안 그러면 SceneCapture가 제자리에서 메인 씬을 찍어 포탈에 숲이 잠깐 뜸)
+    // 이 동안 포탈은 RenderTarget의 마지막 캡처를 그대로 유지.
+    if (!TargetLevel.IsNull() && (!StreamingLevel || !StreamingLevel->GetLoadedLevel()))
+    {
+        bShouldCapture = false;
+    }
+
+    // 비활성(숨김) 레벨은 캡처해도 내용이 없으므로 캡처 금지 → 마지막 캡처 유지.
+    if (!bLevelActive)
+    {
+        bShouldCapture = false;
+    }
+
     // ── Phase 2: Frame Budget Allocator ───────────────────────────
     // 스케줄러가 "내 차례 아님"이라고 하면 캡처 스킵 → 이전 RT 그대로 사용
     if (bShouldCapture && CVarPortalPhase2.GetValueOnGameThread() != 0)
@@ -522,23 +718,28 @@ void APortalActor::Tick(float DeltaTime)
     {
         if (UPortalRTPool* RTPool = GetWorld()->GetSubsystem<UPortalRTPool>())
         {
-            const float Priority = ComputePortalPriority();
-            UTextureRenderTarget2D* HotRT = RTPool->RequestHotRT(this, Priority);
+            // ★ 중요: Phase2 스케줄러가 이번 프레임 캡처를 승인한 포탈(bShouldCapture)만
+            //   공유 풀 Hot 슬롯을 받을 수 있다. 승인 안 된 포탈이 풀 슬롯을 읽으면
+            //   그 슬롯엔 다른 포탈이 캡처한 내용이 들어 있어 화면이 뒤섞인다(머리 흔들 때 증상).
+            //   캡처 안 하는 포탈은 자기 ColdRT(자기 마지막 내용)만 표시한다.
+            UTextureRenderTarget2D* HotRT = bShouldCapture
+                ? RTPool->RequestHotRT(this, ComputePortalPriority())
+                : nullptr;
 
             if (HotRT)
             {
-                // Hot 슬롯 받음 → 풀 RT 사용
+                // Hot 슬롯 받음 → 풀 RT에 캡처하고 그 RT를 표시
                 TargetRT = HotRT;
                 bIsHot = true;
                 LastHotRT = HotRT;
             }
             else
             {
-                // Cold 슬롯 → 캡처 안 함, ColdRT 표시
+                // Cold → 캡처 안 함, 자기 ColdRT(자기 내용) 표시 → 포탈 간 뒤섞임 없음
                 bIsHot = false;
                 bShouldCapture = false;
 
-                // Hot→Cold 전환 감지 시 마지막 백업 캡처
+                // Hot→Cold 전환 시 마지막으로 자기 ColdRT에 백업 (자기 내용 보존)
                 if (LastHotRT && RTPool->WasHotLastFrame(this))
                 {
                     DoFinalColdCapture();

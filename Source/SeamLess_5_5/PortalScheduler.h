@@ -37,6 +37,11 @@ public:
      *  새 프레임이면 예산 기반 선택을 1회 갱신한 뒤, 선택된 집합 포함 여부를 반환. */
     bool ShouldCaptureThisFrame(APortalActor* Portal);
 
+    /** 이 포탈의 레벨을 렌더/Tick 활성으로 둘 것인가?
+     *  우선순위(시선·거리) 상위 ActiveLevels개만 true. 나머지는 숨김(stale 표시).
+     *  → 모여 있는 다른-레벨 다중 포탈에서 동시 렌더 레벨 수를 제한해 CPU·GPU 절감. */
+    bool ShouldLevelBeActive(APortalActor* Portal);
+
     /** 현재 등록된 포탈 수 */
     int32 GetNumPortals() const { return RegisteredPortals.Num(); }
 
@@ -50,6 +55,9 @@ private:
 
     /** 이번 프레임 선택된 포탈 집합 (매 프레임 재구성, transient) */
     TSet<APortalActor*> ChosenThisFrame;
+
+    /** 이번 프레임 레벨을 활성(렌더+Tick)으로 둘 포탈 집합 = 우선순위 상위 N */
+    TSet<APortalActor*> ActiveLevelsThisFrame;
 
     /** 포탈별 마지막 캡처 프레임 (aging 계산용). 등록 해제 시 제거. */
     TMap<APortalActor*, uint64> LastCaptureFrame;

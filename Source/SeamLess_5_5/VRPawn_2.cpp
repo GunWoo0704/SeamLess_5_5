@@ -4,6 +4,18 @@
 #include "Components/CapsuleComponent.h"
 #include "Camera/CameraComponent.h"
 #include "Kismet/GameplayStatics.h"
+#include "Scalability.h"
+#include "HAL/IConsoleManager.h"
+
+// ì‹¤í–‰ ì‹œ ê·¸ë˜í”½ í’ˆì§ˆ(Engine Scalability)ì„ ê°•ì œí•  ë ˆë²¨.
+//   -1 = ê°•ì œ ì•ˆ í•¨(ì—”ì§„/ì‚¬ìš©ì ì„¤ì • ê·¸ëŒ€ë¡œ), 0=Low, 1=Medium, 2=High, 3=Epic
+//   íŒ¨í‚¤ì§€ ë¹Œë“œì—ì„œ GameUserSettings í•˜ë“œì›¨ì–´ ìë™ê°ì§€ê°€ ë®ì–´ì“°ëŠ” ê±¸ ë§‰ì•„ Medium ê³ ì •.
+static TAutoConsoleVariable<int32> CVarForceScalabilityLevel(
+    TEXT("r.Portal.ForceScalabilityLevel"),
+    1,
+    TEXT("ì‹¤í–‰ ì‹œ ê°•ì œí•  ê·¸ë˜í”½ í’ˆì§ˆ ë ˆë²¨. -1=ê°•ì œ ì•ˆ í•¨, 0=Low, 1=Medium, 2=High, 3=Epic. ê¸°ë³¸ 1(Medium)."),
+    ECVF_Default
+);
 
 AVRPawn_2::AVRPawn_2()
 {
@@ -19,14 +31,26 @@ AVRPawn_2::AVRPawn_2()
 
     VRCamera = CreateDefaultSubobject<UCameraComponent>(TEXT("VRCamera"));
     VRCamera->SetupAttachment(VROrigin);
-    VRCamera->bLockToHmd = true;  // HMD ÃßÀû È°¼ºÈ­
+    VRCamera->bLockToHmd = true;  // HMD ï¿½ï¿½ï¿½ï¿½ È°ï¿½ï¿½È­
 }
 
 void AVRPawn_2::BeginPlay()
 {
     Super::BeginPlay();
 
-    // Enhanced Input ¸ÅÇÎ ÄÁÅØ½ºÆ® µî·Ï
+    // â”€â”€ ê·¸ë˜í”½ í’ˆì§ˆ(Engine Scalability) ê°•ì œ â”€â”€
+    // íŒ¨í‚¤ì§€ ë¹Œë“œì—ì„œ GameUserSettings ìë™ê°ì§€ê°€ ConsoleVariables.iniì˜ sg.* ë¥¼
+    // ë®ì–´ì“°ëŠ” ê±¸ ë§‰ì•„, ì‹¤í–‰ ì‹œ í•­ìƒ ì§€ì • ë ˆë²¨(ê¸°ë³¸ Medium)ë¡œ ê³ ì • â†’ ë²¤ì¹˜ë§ˆí¬ ì¼ê´€ì„±.
+    const int32 ForceLevel = CVarForceScalabilityLevel.GetValueOnGameThread();
+    if (ForceLevel >= 0)
+    {
+        Scalability::FQualityLevels Q = Scalability::GetQualityLevels();
+        Q.SetFromSingleQualityLevel(ForceLevel);
+        Scalability::SetQualityLevels(Q);
+        UE_LOG(LogTemp, Warning, TEXT("[VRPawn] Engine Scalability ê°•ì œ ì ìš©: ë ˆë²¨ %d (1=Medium)"), ForceLevel);
+    }
+
+    // Enhanced Input ï¿½ï¿½ï¿½ï¿½ ï¿½ï¿½ï¿½Ø½ï¿½Æ® ï¿½ï¿½ï¿½
     if (APlayerController* PC = Cast<APlayerController>(GetController()))
     {
         if (UEnhancedInputLocalPlayerSubsystem* Subsystem =
@@ -61,11 +85,11 @@ void AVRPawn_2::Move(const FInputActionValue& Value)
     FVector2D MoveInput = Value.Get<FVector2D>();
     if (MoveInput.IsNearlyZero()) return;
 
-    // Ä«¸Ş¶ó°¡ ¹Ù¶óº¸´Â ¹æÇâ ±âÁØÀ¸·Î ÀÌµ¿
+    // Ä«ï¿½Ş¶ï¿½ ï¿½Ù¶óº¸´ï¿½ ï¿½ï¿½ï¿½ï¿½ ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ ï¿½Ìµï¿½
     FVector Forward = VRCamera->GetForwardVector();
     FVector Right = VRCamera->GetRightVector();
 
-    // ¼öÆò ÀÌµ¿¸¸ (ZÃà ¹«½Ã)
+    // ï¿½ï¿½ï¿½ï¿½ ï¿½Ìµï¿½ï¿½ï¿½ (Zï¿½ï¿½ ï¿½ï¿½ï¿½ï¿½)
     Forward.Z = 0.0f;
     Right.Z = 0.0f;
     Forward.Normalize();
@@ -79,7 +103,7 @@ void AVRPawn_2::Turn(const FInputActionValue& Value)
 {
     FVector2D TurnInput = Value.Get<FVector2D>();
 
-    // ½º³À ÅÏ: ÀÔ·ÂÀÌ ÀÓ°è°ª ³ÑÀ¸¸é ÇÑ ¹ø¸¸ È¸Àü
+    // ï¿½ï¿½ï¿½ï¿½ ï¿½ï¿½: ï¿½Ô·ï¿½ï¿½ï¿½ ï¿½Ó°è°ª ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ ï¿½ï¿½ ï¿½ï¿½ï¿½ï¿½ È¸ï¿½ï¿½
     if (FMath::Abs(TurnInput.X) > 0.7f && bCanSnapTurn)
     {
         float TurnDir = TurnInput.X > 0.0f ? SnapTurnAngle : -SnapTurnAngle;
@@ -88,6 +112,6 @@ void AVRPawn_2::Turn(const FInputActionValue& Value)
     }
     else if (FMath::Abs(TurnInput.X) < 0.3f)
     {
-        bCanSnapTurn = true;  // Á¶ÀÌ½ºÆ½ Áß¸³ º¹±Í ½Ã ÀçÈ°¼ºÈ­
+        bCanSnapTurn = true;  // ï¿½ï¿½ï¿½Ì½ï¿½Æ½ ï¿½ß¸ï¿½ ï¿½ï¿½ï¿½ï¿½ ï¿½ï¿½ ï¿½ï¿½È°ï¿½ï¿½È­
     }
 }

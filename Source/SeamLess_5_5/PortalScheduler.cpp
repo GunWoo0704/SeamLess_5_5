@@ -23,6 +23,17 @@ static TAutoConsoleVariable<float> CVarPortalAgingWeight(
     ECVF_Default
 );
 
+// 동시에 렌더+Tick 활성으로 둘 레벨(포탈) 수. 우선순위(시선·거리) 상위 N개.
+//   모여 있는 다른-레벨 다중 포탈에서 동시 렌더 레벨 수를 N으로 묶어 CPU·GPU 절감.
+//   값이 작을수록 빠르지만, 처음 보는(상위 밖) 포탈은 stale/검정으로 보임.
+static TAutoConsoleVariable<int32> CVarPortalActiveLevels(
+    TEXT("r.Portal.ActiveLevels"),
+    3,
+    TEXT("동시에 렌더/Tick 활성으로 둘 포탈 레벨 수(우선순위 상위 N). 기본 3.\n")
+    TEXT("나머지 레벨은 숨기고 Tick 꺼서 비용 절감, 포탈은 마지막 캡처 유지."),
+    ECVF_Default
+);
+
 void UPortalScheduler::RegisterPortal(APortalActor* Portal)
 {
     if (Portal && !RegisteredPortals.Contains(Portal))
@@ -36,6 +47,7 @@ void UPortalScheduler::UnregisterPortal(APortalActor* Portal)
 {
     RegisteredPortals.Remove(Portal);
     ChosenThisFrame.Remove(Portal);
+    ActiveLevelsThisFrame.Remove(Portal);
     LastCaptureFrame.Remove(Portal);
     UE_LOG(LogTemp, Warning, TEXT("[PortalSched] UNREGISTER (total=%d)"), RegisteredPortals.Num());
 }
@@ -47,8 +59,11 @@ void UPortalScheduler::RebuildSelectionIfNewFrame()
     LastScheduledFrame = CurrentFrame;
 
     ChosenThisFrame.Reset();
+    ActiveLevelsThisFrame.Reset();
 
-    // Warmup: 첫 몇 프레임은 모든 포탈 캡처 (RT 초기화)
+    const int32 ActiveLevels = FMath::Max(1, CVarPortalActiveLevels.GetValueOnGameThread());
+
+    // Warmup: 첫 몇 프레임은 모든 포탈 캡처 + 모든 레벨 활성 (RT 초기화)
     if (WarmupFramesRemaining > 0)
     {
         WarmupFramesRemaining--;
@@ -56,6 +71,7 @@ void UPortalScheduler::RebuildSelectionIfNewFrame()
         {
             if (!IsValid(P)) continue;
             ChosenThisFrame.Add(P);
+            ActiveLevelsThisFrame.Add(P);
             LastCaptureFrame.Add(P, CurrentFrame);
         }
         return;
@@ -64,9 +80,11 @@ void UPortalScheduler::RebuildSelectionIfNewFrame()
     const int32 Budget = FMath::Max(1, CVarPortalBudgetCount.GetValueOnGameThread());
     const float AgingW = CVarPortalAgingWeight.GetValueOnGameThread();
 
-    // ── 각 포탈의 urgency 계산 ──
-    TArray<TPair<float, APortalActor*>> Ranked;
-    Ranked.Reserve(RegisteredPortals.Num());
+    // ── 각 포탈의 우선순위(raw) 와 urgency(aging 포함) 계산 ──
+    TArray<TPair<float, APortalActor*>> RankedByUrgency;   // 캡처 선택용
+    TArray<TPair<float, APortalActor*>> RankedByPriority;  // 활성 레벨 선택용(안정적)
+    RankedByUrgency.Reserve(RegisteredPortals.Num());
+    RankedByPriority.Reserve(RegisteredPortals.Num());
     for (APortalActor* P : RegisteredPortals)
     {
         if (!IsValid(P)) continue;
@@ -78,21 +96,42 @@ void UPortalScheduler::RebuildSelectionIfNewFrame()
         const uint64 FramesSince = (Last == 0) ? 1000 : (CurrentFrame - Last);
 
         const float Urgency = Priority * (1.0f + AgingW * static_cast<float>(FramesSince));
-        Ranked.Add(TPair<float, APortalActor*>(Urgency, P));
+        RankedByUrgency.Add(TPair<float, APortalActor*>(Urgency, P));
+        RankedByPriority.Add(TPair<float, APortalActor*>(Priority, P));
     }
 
-    // urgency 내림차순 정렬 후 상위 Budget개 선택
-    Ranked.Sort([](const TPair<float, APortalActor*>& A, const TPair<float, APortalActor*>& B)
+    auto SortDesc = [](const TPair<float, APortalActor*>& A, const TPair<float, APortalActor*>& B)
     {
         return A.Key > B.Key;
-    });
+    };
 
-    const int32 NumChosen = FMath::Min(Budget, Ranked.Num());
+    // 캡처 대상: urgency 상위 Budget개
+    RankedByUrgency.Sort(SortDesc);
+    const int32 NumChosen = FMath::Min(Budget, RankedByUrgency.Num());
     for (int32 i = 0; i < NumChosen; i++)
     {
-        ChosenThisFrame.Add(Ranked[i].Value);
-        LastCaptureFrame.Add(Ranked[i].Value, CurrentFrame);
+        ChosenThisFrame.Add(RankedByUrgency[i].Value);
+        LastCaptureFrame.Add(RankedByUrgency[i].Value, CurrentFrame);
     }
+
+    // 활성 레벨: raw 우선순위(시선·거리) 상위 ActiveLevels개 (aging 미포함 → 안정적, 토글 깜빡임 적음)
+    RankedByPriority.Sort(SortDesc);
+    const int32 NumActive = FMath::Min(ActiveLevels, RankedByPriority.Num());
+    for (int32 i = 0; i < NumActive; i++)
+    {
+        ActiveLevelsThisFrame.Add(RankedByPriority[i].Value);
+    }
+}
+
+bool UPortalScheduler::ShouldLevelBeActive(APortalActor* Portal)
+{
+    const int32 ActiveLevels = FMath::Max(1, CVarPortalActiveLevels.GetValueOnGameThread());
+
+    // 포탈 수가 활성 한도 이하면 전부 활성
+    if (RegisteredPortals.Num() <= ActiveLevels) return true;
+
+    RebuildSelectionIfNewFrame();
+    return ActiveLevelsThisFrame.Contains(Portal);
 }
 
 bool UPortalScheduler::ShouldCaptureThisFrame(APortalActor* Portal)
