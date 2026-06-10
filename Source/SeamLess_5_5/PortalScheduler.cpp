@@ -1,6 +1,13 @@
 #include "PortalScheduler.h"
 #include "PortalActor.h"
 #include "HAL/IConsoleManager.h"
+#include "ProfilingDebugging/CsvProfiler.h"
+#include "TimerManager.h"
+#include "Engine/World.h"
+
+// CSV 카테고리 "Portal" — csv.Start 캡처 시 Portal/* 열로 기록됨.
+// G4(갱신 주기 vs N) 그래프와 스케줄러 동작 검증의 데이터 소스.
+CSV_DEFINE_CATEGORY(Portal, true);
 
 // ───────────────────────────────────────────────────────────────
 // 캡처 예산: 프레임당 풀 캡처를 허용할 포탈 수. N과 무관한 상수 → 프레임 O(1).
@@ -74,6 +81,7 @@ void UPortalScheduler::RebuildSelectionIfNewFrame()
             ActiveLevelsThisFrame.Add(P);
             LastCaptureFrame.Add(P, CurrentFrame);
         }
+        RecordCsvStats(CurrentFrame);
         return;
     }
 
@@ -121,26 +129,134 @@ void UPortalScheduler::RebuildSelectionIfNewFrame()
     {
         ActiveLevelsThisFrame.Add(RankedByPriority[i].Value);
     }
+
+    RecordCsvStats(CurrentFrame);
 }
+
+// ───────────────────────────────────────────────────────────────
+// CSV 계측 (csv.Start 중일 때만 비용 발생, 평상시 no-op)
+//   Portal/NumPortals       등록 포탈 수 (측정 셀 검증용)
+//   Portal/NumCaptured      이번 프레임 풀 캡처 수 (= Budget 준수 확인)
+//   Portal/NumActiveLevels  이번 프레임 활성 레벨 수 (= ActiveLevels 준수 확인)
+//   Portal/MaxStaleFrames   가장 오래 갱신 안 된 포탈의 미갱신 프레임 수 ← M2 목표 스펙
+//   Portal/AvgStaleFrames   평균 미갱신 프레임 수 (이론치 N/Budget 과 비교)
+void UPortalScheduler::RecordCsvStats(uint64 CurrentFrame)
+{
+#if CSV_PROFILER
+    int32 MaxStale = 0;
+    float SumStale = 0.0f;
+    int32 Count = 0;
+    for (APortalActor* P : RegisteredPortals)
+    {
+        if (!IsValid(P)) continue;
+        const uint64 Last = LastCaptureFrame.FindRef(P);
+        // Warmup이 전 포탈을 캡처하므로 Last==0(미캡처)은 등록 직후 한 프레임뿐 → 0 처리
+        const int32 Stale = (Last == 0) ? 0 : static_cast<int32>(CurrentFrame - Last);
+        MaxStale = FMath::Max(MaxStale, Stale);
+        SumStale += static_cast<float>(Stale);
+        Count++;
+    }
+    CSV_CUSTOM_STAT(Portal, NumPortals,      Count,                                      ECsvCustomStatOp::Set);
+    CSV_CUSTOM_STAT(Portal, NumCaptured,     ChosenThisFrame.Num(),                      ECsvCustomStatOp::Set);
+    CSV_CUSTOM_STAT(Portal, NumActiveLevels, ActiveLevelsThisFrame.Num(),                ECsvCustomStatOp::Set);
+    CSV_CUSTOM_STAT(Portal, MaxStaleFrames,  MaxStale,                                   ECsvCustomStatOp::Set);
+    CSV_CUSTOM_STAT(Portal, AvgStaleFrames,  (Count > 0) ? SumStale / Count : 0.0f,      ECsvCustomStatOp::Set);
+#endif
+}
+
+// ───────────────────────────────────────────────────────────────
+// Sprint 0-3: 측정 1셀 자동 실행 커맨드
+//
+//   Portal.Benchmark <BudgetCount> <ActiveLevels> [WarmupSec=10] [CaptureSec=30]
+//
+//   1) CVar 설정 → 2) WarmupSec 대기(Lumen 수렴·스케줄러 워밍업)
+//   3) CSV 캡처 시작 → 4) CaptureSec 후 종료
+//   출력: Saved/Profiling/CSV/Portal_N{포탈수}_B{예산}_A{활성레벨}_{시각}.csv
+//   → 측정계획.md의 셀 1개 = 커맨드 1회. 파일명만으로 분석 스크립트가 조건 식별.
+#if CSV_PROFILER
+static FTimerHandle GPortalBenchWarmupHandle;
+static FTimerHandle GPortalBenchStopHandle;
+
+static FAutoConsoleCommandWithWorldAndArgs CmdPortalBenchmark(
+    TEXT("Portal.Benchmark"),
+    TEXT("측정 1셀 자동 실행: Portal.Benchmark <BudgetCount> <ActiveLevels> [WarmupSec=10] [CaptureSec=30]"),
+    FConsoleCommandWithWorldAndArgsDelegate::CreateLambda(
+        [](const TArray<FString>& Args, UWorld* World)
+        {
+            if (!World) return;
+
+            const int32 Budget   = (Args.Num() > 0) ? FCString::Atoi(*Args[0]) : 1;
+            const int32 Active   = (Args.Num() > 1) ? FCString::Atoi(*Args[1]) : 3;
+            const float WarmupS  = (Args.Num() > 2) ? FCString::Atof(*Args[2]) : 10.0f;
+            const float CaptureS = (Args.Num() > 3) ? FCString::Atof(*Args[3]) : 30.0f;
+
+            CVarPortalBudgetCount.AsVariable()->Set(Budget, ECVF_SetByConsole);
+            CVarPortalActiveLevels.AsVariable()->Set(Active, ECVF_SetByConsole);
+
+            const UPortalScheduler* Sched = World->GetSubsystem<UPortalScheduler>();
+            const int32 NumPortals = Sched ? Sched->GetNumPortals() : -1;
+
+            // Phase2(스케줄러) OFF = Naive 베이스라인 → 파일명에 태그 (분석 스크립트가 조건 식별)
+            bool bNaive = false;
+            if (const IConsoleVariable* Phase2 = IConsoleManager::Get().FindConsoleVariable(TEXT("r.Portal.Phase2")))
+            {
+                bNaive = (Phase2->GetInt() == 0);
+            }
+
+            const FString FileName = FString::Printf(TEXT("Portal_N%d_B%d_A%d_%s%s.csv"),
+                NumPortals, Budget, Active,
+                bNaive ? TEXT("naive_") : TEXT(""),
+                *FDateTime::Now().ToString(TEXT("%m%d-%H%M%S")));
+
+            UE_LOG(LogTemp, Warning,
+                TEXT("[PortalBench] N=%d Budget=%d Active=%d | warmup %.0fs → capture %.0fs → %s.csv"),
+                NumPortals, Budget, Active, WarmupS, CaptureS, *FileName);
+
+            TWeakObjectPtr<UWorld> WeakWorld = World;
+            World->GetTimerManager().SetTimer(GPortalBenchWarmupHandle,
+                FTimerDelegate::CreateLambda([WeakWorld, FileName, CaptureS]()
+                {
+                    if (!WeakWorld.IsValid()) return;
+
+                    FCsvProfiler::Get()->BeginCapture(-1, FString(), FileName);
+                    UE_LOG(LogTemp, Warning, TEXT("[PortalBench] CSV capture START (%s)"), *FileName);
+
+                    WeakWorld->GetTimerManager().SetTimer(GPortalBenchStopHandle,
+                        FTimerDelegate::CreateLambda([]()
+                        {
+                            FCsvProfiler::Get()->EndCapture();
+                            UE_LOG(LogTemp, Warning,
+                                TEXT("[PortalBench] CSV capture END → Saved/Profiling/CSV/"));
+                        }),
+                        CaptureS, false);
+                }),
+                WarmupS, false);
+        })
+);
+#endif // CSV_PROFILER
 
 bool UPortalScheduler::ShouldLevelBeActive(APortalActor* Portal)
 {
+    // CSV 계측이 매 프레임 기록되도록 early-return 전에 선택 갱신
+    // (N ≤ 한도면 Rebuild가 전부 선택하므로 결과는 동일)
+    RebuildSelectionIfNewFrame();
+
     const int32 ActiveLevels = FMath::Max(1, CVarPortalActiveLevels.GetValueOnGameThread());
 
     // 포탈 수가 활성 한도 이하면 전부 활성
     if (RegisteredPortals.Num() <= ActiveLevels) return true;
 
-    RebuildSelectionIfNewFrame();
     return ActiveLevelsThisFrame.Contains(Portal);
 }
 
 bool UPortalScheduler::ShouldCaptureThisFrame(APortalActor* Portal)
 {
+    RebuildSelectionIfNewFrame();
+
     const int32 Budget = FMath::Max(1, CVarPortalBudgetCount.GetValueOnGameThread());
 
     // 포탈 수가 예산 이하면 전부 캡처 가능 (스케줄링 불필요)
     if (RegisteredPortals.Num() <= Budget) return true;
 
-    RebuildSelectionIfNewFrame();
     return ChosenThisFrame.Contains(Portal);
 }

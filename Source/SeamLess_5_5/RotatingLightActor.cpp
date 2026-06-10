@@ -18,7 +18,6 @@ void ARotatingLightActor::Tick(float DeltaTime)
     Super::Tick(DeltaTime);
 
     // RotationDuration이 0(또는 음수/비정상)이면 360/0 = inf → NaN 회전 → 크래시.
-    // 안전하게 방어: 유효하지 않으면 이번 틱은 건너뛴다.
     if (!FMath::IsFinite(RotationDuration) || RotationDuration <= KINDA_SMALL_NUMBER)
     {
         return;

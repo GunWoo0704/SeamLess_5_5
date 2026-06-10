@@ -214,6 +214,10 @@ private:
     /** 레벨이 현재 렌더+Tick 활성 상태인지 (SetLevelActive 토글 추적) */
     bool bLevelActive = true;
 
+    /** 이 포탈이 유효한 캡처(내용)를 한 번이라도 가졌는지.
+     *  false면 게이팅/예산을 무시하고 강제로 로드·활성·캡처해서 검은 포탈을 막는다. */
+    bool bHasCapturedOnce = false;
+
     /** 스트리밍 레벨 액터 캐시.
      *  반드시 UPROPERTY(GC 추적)여야 함 — raw 포인터로 두면 레벨 언로드/액터 파괴 시
      *  댕글링 포인터가 되어 GetComponentsBoundingBox 등에서 access violation 크래시 발생.

@@ -365,7 +365,13 @@ void APortalActor::UpdateLevelResidency()
     if (!World) return;
 
     APawn* Pawn = UGameplayStatics::GetPlayerPawn(World, 0);
-    if (!Pawn) return;
+    if (!Pawn)
+    {
+        // 플레이어 폰이 없으면(예: Simulate 모드) 거리 판정 불가 →
+        // 그냥 레벨을 로드해 두고 언로드는 하지 않음 (검은 포탈 방지).
+        if (!bLevelAcquired) LoadTargetLevel();
+        return;
+    }
 
     const float Dist = FVector::Dist(Pawn->GetActorLocation(), GetActorLocation());
     const float LoadDist = CVarPortalLevelLoadDist.GetValueOnGameThread();
@@ -592,9 +598,11 @@ void APortalActor::Tick(float DeltaTime)
     // ── 활성 레벨 게이팅 ─────────────────────────────────────
     // 모여 있는 다른-레벨 다중 포탈: 우선순위 상위 N개 레벨만 렌더+Tick,
     // 나머지는 숨기고 Tick 꺼서 CPU·GPU 동시 절감. (포탈은 마지막 캡처 유지)
-    if (UPortalScheduler* Sched = GetWorld()->GetSubsystem<UPortalScheduler>())
     {
-        SetLevelActive(Sched->ShouldLevelBeActive(this));
+        UPortalScheduler* Sched = GetWorld()->GetSubsystem<UPortalScheduler>();
+        // 아직 한 번도 캡처 못 한 포탈은 게이팅 무시하고 강제 활성 → 검은 포탈 방지.
+        const bool bActive = !bHasCapturedOnce || !Sched || Sched->ShouldLevelBeActive(this);
+        SetLevelActive(bActive);
     }
 
     // ── Phase 1 런타임 토글 감지 ─────────────────────────────
@@ -666,14 +674,17 @@ void APortalActor::Tick(float DeltaTime)
         ? PlayerPawn->FindComponentByClass<UCameraComponent>()
         : nullptr;
 
-    if (!PlayerPawn || !Camera) return;
-
-    // VR에서는 Overlap이 안 잡히는 경우가 많아서 Tick에서 직접 감지
-    CheckPortalCrossing(Camera);
-
-    float DistToPortal = FVector::Dist(
-        PlayerPawn->GetActorLocation(),
-        GetActorLocation());
+    // 플레이어/카메라가 있을 때만 포탈 통과 감지 + 거리 계산.
+    // 없으면(예: Simulate 모드) DistToPortal=0(=가까움)으로 둬서 캡처는 계속 진행 → 검은 포탈 방지.
+    const bool bHasViewer = (PlayerPawn && Camera);
+    if (bHasViewer)
+    {
+        // VR에서는 Overlap이 안 잡히는 경우가 많아서 Tick에서 직접 감지
+        CheckPortalCrossing(Camera);
+    }
+    const float DistToPortal = bHasViewer
+        ? FVector::Dist(PlayerPawn->GetActorLocation(), GetActorLocation())
+        : 0.0f;
 
     // Lumen GI는 bCaptureEveryFrame=true 상태에서 연속 프레임을 통해 누적됨
     // 수동 CaptureScene()은 Lumen 입장에서 매번 새 뷰 → GI 누적 안 됨
@@ -761,7 +772,23 @@ void APortalActor::Tick(float DeltaTime)
         DynamicMaterial->SetTextureParameterValue(FName("RenderTargetRight"), TargetRT);
     }
 
+    // 레벨이 준비됐는지 (스트리밍 모드면 로드 완료, LinkedPortal 모드면 항상 ok)
+    const bool bLevelReady = TargetLevel.IsNull()
+        || (StreamingLevel && StreamingLevel->GetLoadedLevel());
+
+    // 아직 한 번도 캡처 못 한 포탈은 예산/게이팅 무시하고 강제 캡처 → 검은 포탈 방지.
+    if (!bHasCapturedOnce && bLevelReady)
+    {
+        bShouldCapture = true;
+    }
+
     SceneCapture->bCaptureEveryFrame = bShouldCapture;
+
+    // 실제로 캡처가 일어나면(레벨 준비 완료) "내용 있음"으로 표시 → 이후 게이팅 허용
+    if (bShouldCapture && bLevelReady)
+    {
+        bHasCapturedOnce = true;
+    }
 
     if (!TargetLevel.IsNull() && StreamingLevel && StreamingLevel->GetLoadedLevel())
     {
@@ -773,7 +800,8 @@ void APortalActor::Tick(float DeltaTime)
         //   - ZeroRotator: 순수 플레이어 머리 회전만 사용 (기본 동작)
         //   - 값 있음: TargetCaptureRotation * PlayerRot 순서로 quaternion 합성
         // TargetViewTransform = 레벨 스폰 위치 (BeginPlay에서만 사용)
-        FRotator PlayerRot = Camera->GetComponentRotation();
+        // 카메라 없으면(Simulate) 회전 0으로 폴백 → 크래시 방지하고 캡처는 진행
+        FRotator PlayerRot = Camera ? Camera->GetComponentRotation() : FRotator::ZeroRotator;
         FRotator FinalCaptureRot;
         if (TargetCaptureRotation.IsNearlyZero())
         {

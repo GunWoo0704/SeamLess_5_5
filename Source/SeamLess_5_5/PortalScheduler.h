@@ -49,6 +49,9 @@ private:
     /** 새 프레임이면 urgency 기준으로 이번 프레임 캡처 대상(top-K)을 다시 고른다. */
     void RebuildSelectionIfNewFrame();
 
+    /** CSV 커스텀 스탯 기록 (Portal/NumCaptured, MaxStaleFrames 등). csv.Start 중에만 동작. */
+    void RecordCsvStats(uint64 CurrentFrame);
+
     /** GC 추적 필요 — 매 프레임 순회하므로 댕글링 방지 */
     UPROPERTY()
     TArray<TObjectPtr<APortalActor>> RegisteredPortals;
