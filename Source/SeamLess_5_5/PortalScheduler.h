@@ -5,6 +5,7 @@
 #include "PortalScheduler.generated.h"
 
 class APortalActor;
+class UCameraComponent;
 
 /**
  * Frame Budget Allocator — 지각 기반 캡처 예산 스케줄러.
@@ -45,6 +46,11 @@ public:
     /** 현재 등록된 포탈 수 */
     int32 GetNumPortals() const { return RegisteredPortals.Num(); }
 
+    /** 플레이어 뷰 카메라(헤드)를 프레임당 1회만 조회해 캐싱 반환.
+     *  포탈마다 GetPlayerPawn + FindComponentByClass(비싼 호출)를 반복하던 걸 제거.
+     *  포탈 수 N에 비례하던 CPU 비용을 O(1)로. */
+    UCameraComponent* GetActiveCamera();
+
 private:
     /** 새 프레임이면 urgency 기준으로 이번 프레임 캡처 대상(top-K)을 다시 고른다. */
     void RebuildSelectionIfNewFrame();
@@ -62,11 +68,18 @@ private:
     /** 이번 프레임 레벨을 활성(렌더+Tick)으로 둘 포탈 집합 = 우선순위 상위 N */
     TSet<APortalActor*> ActiveLevelsThisFrame;
 
+    /** 직전 프레임 활성 집합 — 히스테리시스(경계 깜빡임 방지)용 */
+    TSet<APortalActor*> PrevActiveLevels;
+
     /** 포탈별 마지막 캡처 프레임 (aging 계산용). 등록 해제 시 제거. */
     TMap<APortalActor*, uint64> LastCaptureFrame;
 
     /** 프레임 변화 감지 (GFrameCounter) */
     uint64 LastScheduledFrame = TNumericLimits<uint64>::Max();
+
+    /** 카메라 캐시 (프레임당 1회 조회) */
+    TWeakObjectPtr<UCameraComponent> CachedCamera;
+    uint64 CachedCameraFrame = TNumericLimits<uint64>::Max();
 
     /** Warmup: 첫 몇 프레임은 모든 포탈 캡처해서 RT 초기화 */
     int32 WarmupFramesRemaining = 8;

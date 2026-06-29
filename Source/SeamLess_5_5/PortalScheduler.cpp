@@ -1,6 +1,9 @@
 #include "PortalScheduler.h"
 #include "PortalActor.h"
 #include "HAL/IConsoleManager.h"
+#include "Camera/CameraComponent.h"
+#include "GameFramework/Pawn.h"
+#include "Kismet/GameplayStatics.h"
 #include "ProfilingDebugging/CsvProfiler.h"
 #include "TimerManager.h"
 #include "Engine/World.h"
@@ -41,6 +44,15 @@ static TAutoConsoleVariable<int32> CVarPortalActiveLevels(
     ECVF_Default
 );
 
+// 활성 집합 히스테리시스: 직전 프레임 활성이던 레벨의 우선순위에 곱해주는 보너스.
+//   1보다 크면 "한번 활성이면 잘 안 바뀜" → 경계에서 깜빡임(프레임 스파이크) 방지.
+static TAutoConsoleVariable<float> CVarPortalActiveHysteresis(
+    TEXT("r.Portal.ActiveHysteresis"),
+    1.5f,
+    TEXT("직전 활성 레벨에 주는 우선순위 보너스 배율(끈적임). 기본 1.5. 1.0=히스테리시스 없음."),
+    ECVF_Default
+);
+
 void UPortalScheduler::RegisterPortal(APortalActor* Portal)
 {
     if (Portal && !RegisteredPortals.Contains(Portal))
@@ -55,6 +67,7 @@ void UPortalScheduler::UnregisterPortal(APortalActor* Portal)
     RegisteredPortals.Remove(Portal);
     ChosenThisFrame.Remove(Portal);
     ActiveLevelsThisFrame.Remove(Portal);
+    PrevActiveLevels.Remove(Portal);
     LastCaptureFrame.Remove(Portal);
     UE_LOG(LogTemp, Warning, TEXT("[PortalSched] UNREGISTER (total=%d)"), RegisteredPortals.Num());
 }
@@ -65,10 +78,13 @@ void UPortalScheduler::RebuildSelectionIfNewFrame()
     if (CurrentFrame == LastScheduledFrame) return;
     LastScheduledFrame = CurrentFrame;
 
+    // 직전 활성 집합 보존(히스테리시스) 후 리셋
+    PrevActiveLevels = ActiveLevelsThisFrame;
     ChosenThisFrame.Reset();
     ActiveLevelsThisFrame.Reset();
 
     const int32 ActiveLevels = FMath::Max(1, CVarPortalActiveLevels.GetValueOnGameThread());
+    const float Hysteresis = CVarPortalActiveHysteresis.GetValueOnGameThread();
 
     // Warmup: 첫 몇 프레임은 모든 포탈 캡처 + 모든 레벨 활성 (RT 초기화)
     if (WarmupFramesRemaining > 0)
@@ -105,7 +121,10 @@ void UPortalScheduler::RebuildSelectionIfNewFrame()
 
         const float Urgency = Priority * (1.0f + AgingW * static_cast<float>(FramesSince));
         RankedByUrgency.Add(TPair<float, APortalActor*>(Urgency, P));
-        RankedByPriority.Add(TPair<float, APortalActor*>(Priority, P));
+
+        // 활성 레벨 랭킹엔 히스테리시스 적용: 직전 활성이면 우선순위에 보너스 → 잘 안 바뀜
+        const float PriorityForActive = PrevActiveLevels.Contains(P) ? (Priority * Hysteresis) : Priority;
+        RankedByPriority.Add(TPair<float, APortalActor*>(PriorityForActive, P));
     }
 
     auto SortDesc = [](const TPair<float, APortalActor*>& A, const TPair<float, APortalActor*>& B)
@@ -234,6 +253,26 @@ static FAutoConsoleCommandWithWorldAndArgs CmdPortalBenchmark(
         })
 );
 #endif // CSV_PROFILER
+
+UCameraComponent* UPortalScheduler::GetActiveCamera()
+{
+    const uint64 Frame = GFrameCounter;
+    if (Frame == CachedCameraFrame)
+    {
+        return CachedCamera.Get();  // 같은 프레임이면 캐시 반환 (비싼 조회 생략)
+    }
+    CachedCameraFrame = Frame;
+    CachedCamera = nullptr;
+
+    if (UWorld* World = GetWorld())
+    {
+        if (APawn* Pawn = UGameplayStatics::GetPlayerPawn(World, 0))
+        {
+            CachedCamera = Pawn->FindComponentByClass<UCameraComponent>();
+        }
+    }
+    return CachedCamera.Get();
+}
 
 bool UPortalScheduler::ShouldLevelBeActive(APortalActor* Portal)
 {
